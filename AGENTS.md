@@ -8,7 +8,7 @@
 ## Commands (executable sources of truth)
 - `go build ./...` — build everything
 - `go vet ./...` — vet
-- `go test ./...` — run tests (only `config` package has tests; no DB integration tests run locally)
+- `go test ./...` — run tests
 - `cd web && npm install` then `npm run build` — frontend (Vite + Vue 3 + Bulma). Dev server proxies `/api` to `http://localhost:8080`.
 
 Go module: `selfhosted-gaming-vdi`, go 1.26.0.
@@ -22,9 +22,19 @@ Optional with defaults:
 - `VDI_VM_DELETION_DELAY` — default `30*24h` after `last_user_session` (1 month)
 - `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token)
 - `VDI_LISTEN_ADDR` — default `:8080`
-- `VDI_PROXMOX_BASE`, `VDI_PROXMOX_NODE`, `VDI_PROXMOX_TOKEN` — Proxmox API (API token auth)
-- `VDI_KUBECONFIG` — Talos node management via Kubernetes client
-- Agent: `VDI_SERVER_URL`, `VDI_VM_ID`, `VDI_GAME_LIB`, `VDI_SMB_SHARE`, `VDI_SMB_CREDS`, `VDI_IDLE_SECS` (default 1800s)
+- `VDI_IDLE_SECS` — agent idle shutdown seconds (default 1800)
+- `VDI_PROXMOX_BASE`, `VDI_PROXMOX_NODE` — Proxmox API base URL + node name
+- `VDI_PROXMOX_AUTH_MODE` — `token` (default) or `password`
+- `VDI_PROXMOX_TOKEN` — API token secret `userid!tokenid=secret` (token mode)
+- `VDI_PROXMOX_USER`, `VDI_PROXMOX_PASSWORD` — username/password (password mode)
+- `VDI_LIBRARY_PATH` — default game library mount path advertised to agents
+- `VDI_LOKI_URL` — remote Loki endpoint for agent logs (empty = disabled)
+- `VDI_KUBERNETES_MODE` — `auto` (default), `incluster`, or `outofcluster`
+- `VDI_KUBECONFIG` — kubeconfig path (out-of-cluster mode)
+- `VDI_AGENT_TOKEN` — shared bearer token agents use to authenticate to server agent endpoints
+
+Agent env vars:
+- `VDI_SERVER_URL`, `VDI_VM_ID`, `VDI_GAME_LIB`, `VDI_SMB_SHARE`, `VDI_SMB_CREDS`, `VDI_IDLE_SECS` (default 1800s), `VDI_AGENT_TOKEN`, `VDI_LOKI_URL`
 
 External infrastructure is required to run end-to-end (PostgreSQL, Proxmox cluster, Kubernetes/Talos, OIDC provider, SMB share). Do not add integration tests that depend on these.
 
@@ -35,14 +45,16 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 - All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migrate` (GORM AutoMigrate)
 
 ## Architecture boundaries
-- `internal/server` — OIDC JWT verification (JWKS), RBAC middleware, REST API (`/games`, `/sessions`, `/sessions/{id}/override`, `/users`, `/config`, `/health`), PEGI age gating
-- `internal/proxmox` — VM list/get/clone/start/stop/delete
-- `internal/k8s` — Talos node cordon/drain/delete
+- `internal/server` — OIDC JWT verification (JWKS), RBAC middleware, REST API (`/games`, `/sessions`, `/sessions/{id}/override`, `/users`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
+- `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
+- `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
 - `internal/backup` — periodic backup tick + VM deletion after `last_user_session + delay`
-- `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown
+- `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown, Loki logging, VM ops via server only (never direct Proxmox)
 - `internal/firewall` — ephemeral co-op pinholes with TTL
 
 ## Gotchas
 - `server` binary at repo root is a build artifact; gitignored along with `web/node_modules` and `web/dist`.
 - Empty `VDI_OIDC_ISSUER` disables real OIDC verification (dev-only). Do not ship with it empty.
 - Frontend build output goes to `web/dist`; do not commit it.
+- Agent–VM interaction on the Proxmox side goes through the server (`/agent/vm/*`); agents must not call Proxmox directly.
+- When running the server in Kubernetes with `VDI_KUBERNETES_MODE=incluster`, the pod's ServiceAccount needs RBAC to list/patch Talos nodes.

@@ -55,6 +55,38 @@
         </p>
       </div>
 
+      <!-- Admin: game library path management -->
+      <div v-if="isAdmin" class="box mt-4" :class="themeClass">
+        <h2 class="subtitle">Game library paths (admin)</h2>
+        <table class="table is-fullwidth is-striped" :class="themeClass">
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Library path</th>
+              <th>PEGI</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="g in allGames" :key="g.id">
+              <td>{{ g.title }}</td>
+              <td>
+                <div class="field is-grouped">
+                  <div class="control is-expanded">
+                    <input class="input" type="text" v-model="libraryEdits[g.id]" />
+                  </div>
+                  <div class="control">
+                    <button class="button is-small is-success" @click="saveLibraryPath(g)">Save</button>
+                  </div>
+                </div>
+              </td>
+              <td>{{ g.pegi_rating }}</td>
+              <td></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
       <table class="table is-fullwidth is-striped mt-4" :class="themeClass">
         <thead>
           <tr>
@@ -96,8 +128,10 @@ const msg = ref("")
 const games = ref([])
 const allGames = ref([])
 const user = ref(null)
+const isAdmin = ref(false)
 const showOverride = ref(false)
 const override = ref({ cpu_cores: 2, ram_size: 4096, disk_size: 128 })
+const libraryEdits = ref({})
 
 const themeClass = computed(() => {
   const t = theme.value
@@ -128,11 +162,6 @@ function setTheme() {
   document.documentElement.className = themeClass.value
 }
 
-onMounted(() => {
-  setTheme()
-  load()
-})
-
 async function api(path, opts = {}) {
   const headers = { ...opts.headers }
   const token = localStorage.getItem("token")
@@ -147,12 +176,21 @@ async function load() {
     const g = await api("/games")
     allGames.value = g
     games.value = g
-    const u = localStorage.getItem("user")
-    user.value = u ? JSON.parse(u) : null
+    g.forEach((game) => {
+      libraryEdits.value[game.id] = game.library_path || ""
+    })
+    const me = await api("/me")
+    user.value = me
+    isAdmin.value = me.role === "admin"
   } catch (e) {
     error.value = e.message
   }
 }
+
+onMounted(() => {
+  setTheme()
+  load()
+})
 
 async function play(g) {
   error.value = ""
@@ -179,6 +217,21 @@ async function applyOverride() {
       body: JSON.stringify(override.value),
     })
     msg.value = "Override applied"
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function saveLibraryPath(g) {
+  error.value = ""
+  msg.value = ""
+  try {
+    await api("/games/" + g.id, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ library_path: libraryEdits.value[g.id] }),
+    })
+    msg.value = "Library path updated"
   } catch (e) {
     error.value = e.message
   }

@@ -6,6 +6,7 @@ import (
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
 )
@@ -34,6 +35,19 @@ func New(kubeconfig string) (*Client, error) {
 // NewWithClientset builds a Client backed by an existing clientset (for tests).
 func NewWithClientset(cs kubernetes.Interface) *Client {
 	return &Client{clientset: cs}
+}
+
+// NewInCluster builds a Client using the in-cluster service account token.
+func NewInCluster() (*Client, error) {
+	restConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{clientset: clientset}, nil
 }
 
 // Cordon marks a node unschedulable.

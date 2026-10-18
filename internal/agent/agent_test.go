@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestRegister(t *testing.T) {
@@ -28,7 +30,7 @@ func TestRegister(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, "vm-42", "/tmp/gamelib")
+	a := New(srv.URL, "vm-42", "/tmp/gamelib", "")
 	if err := a.Register(testCtxAgent()); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -47,7 +49,7 @@ func TestGamesaveRoundTrip(t *testing.T) {
 		t.Fatalf("write save: %v", err)
 	}
 
-	a := New("http://x", "vm-7", dir)
+	a := New("http://x", "vm-7", dir, "")
 
 	if err := a.SaveGamesave(saveDir); err != nil {
 		t.Fatalf("save gamesave: %v", err)
@@ -69,3 +71,47 @@ func TestGamesaveRoundTrip(t *testing.T) {
 }
 
 func testCtxAgent() context.Context { return context.Background() }
+
+func TestLokiPayload(t *testing.T) {
+	var captured []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	loki := NewLoki(srv.URL, "vm-42")
+	loki.push(LevelInfo, "hello world")
+	// wait for async send
+	time.Sleep(100 * time.Millisecond)
+
+	var parsed struct {
+		Streams []struct {
+			Stream map[string]string `json:"stream"`
+			Values [][]string        `json:"values"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(captured, &parsed); err != nil {
+		t.Fatalf("decode loki payload: %v", err)
+	}
+	if len(parsed.Streams) != 1 {
+		t.Fatalf("expected 1 stream, got %d", len(parsed.Streams))
+	}
+	if parsed.Streams[0].Stream["vm_id"] != "vm-42" {
+		t.Fatalf("unexpected vm_id label: %v", parsed.Streams[0].Stream)
+	}
+	if len(parsed.Streams[0].Values) != 1 {
+		t.Fatalf("expected 1 value, got %d", len(parsed.Streams[0].Values))
+	}
+	if !strings.Contains(parsed.Streams[0].Values[0][1], "[info] hello world") {
+		t.Fatalf("unexpected log line: %q", parsed.Streams[0].Values[0][1])
+	}
+}
+
+func TestLoggerLevels(t *testing.T) {
+	lg := NewLogger(nil)
+	lg.Debug("debug msg")
+	lg.Info("info msg")
+	lg.Warn("warn msg")
+	lg.Error("error msg")
+}

@@ -13,14 +13,15 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 - Kyber (primary) / Apollo + Moonlight Web (fallback) streaming
 - Ludusavi gamesave copy
 - SMB game library mount
+- Loki remote logging for agent logs
 
 ## Architecture boundaries
 
-- `internal/server` — OIDC JWT verification (JWKS), RBAC middleware, REST API (`/games`, `/sessions`, `/sessions/{id}/override`, `/users`, `/config`, `/health`), PEGI age gating
-- `internal/proxmox` — VM list/get/clone/start/stop/delete
-- `internal/k8s` — Talos node cordon/drain/delete
+- `internal/server` — OIDC JWT verification (JWKS), RBAC middleware, REST API (`/games`, `/sessions`, `/sessions/{id}/override`, `/users`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
+- `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
+- `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
 - `internal/backup` — periodic backup tick + VM deletion after `last_user_session + delay`
-- `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown
+- `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown, Loki logging, VM ops via server only (never direct Proxmox)
 - `internal/firewall` — ephemeral co-op pinholes with TTL
 
 ## Quickstart
@@ -29,18 +30,32 @@ Required env var (env only, no config file):
 
 - `VDI_DATABASE_DSN` — PostgreSQL connection string. No local DB is available; `db.Open`/`db.Migrate` cannot be exercised without one.
 
-Optional env vars with defaults:
+Server optional env vars with defaults:
 
 - `VDI_BACKUP_INTERVAL` — default `7*24h` (once per week)
 - `VDI_VM_DELETION_DELAY` — default `30*24h` after `last_user_session` (1 month)
 - `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token)
 - `VDI_LISTEN_ADDR` — default `:8080`
-- `VDI_PROXMOX_BASE`, `VDI_PROXMOX_NODE`, `VDI_PROXMOX_TOKEN` — Proxmox API (API token auth)
-- `VDI_KUBECONFIG` — Talos node management via Kubernetes client
+- `VDI_IDLE_SECS` — agent idle shutdown in seconds (default `1800`)
+- `VDI_PROXMOX_BASE`, `VDI_PROXMOX_NODE` — Proxmox API base URL + node name
+- `VDI_PROXMOX_AUTH_MODE` — `token` (default) or `password`
+- `VDI_PROXMOX_TOKEN` — API token secret `userid!tokenid=secret` (token mode)
+- `VDI_PROXMOX_USER`, `VDI_PROXMOX_PASSWORD` — username/password (password mode)
+- `VDI_LIBRARY_PATH` — default game library mount path advertised to agents
+- `VDI_LOKI_URL` — remote Loki endpoint for agent logs (empty = disabled)
+- `VDI_KUBERNETES_MODE` — `auto` (default), `incluster`, or `outofcluster`
+- `VDI_KUBECONFIG` — kubeconfig path (out-of-cluster mode)
+- `VDI_AGENT_TOKEN` — shared bearer token agents use to authenticate to the server
 
 Agent env vars:
 
-- `VDI_SERVER_URL`, `VDI_VM_ID`, `VDI_GAME_LIB`, `VDI_SMB_SHARE`, `VDI_SMB_CREDS`, `VDI_IDLE_SECS` (default `1800s`)
+- `VDI_SERVER_URL` — server base URL (default `http://localhost:8080`)
+- `VDI_VM_ID` — VM identifier this agent represents
+- `VDI_GAME_LIB` — game library path (falls back to `VDI_LIBRARY_PATH`)
+- `VDI_SMB_SHARE`, `VDI_SMB_CREDS` — SMB share + credentials (optional mount)
+- `VDI_IDLE_SECS` — idle shutdown seconds (default 1800)
+- `VDI_AGENT_TOKEN` — bearer token sent to server agent endpoints
+- `VDI_LOKI_URL` — remote Loki endpoint for agent logs (optional)
 
 Build, run, frontend:
 
@@ -51,7 +66,27 @@ go run ./cmd/agent        # runs inside a VM: registration, streaming, gamesaves
 cd web && npm install && npm run build
 ```
 
-Tests: `go test ./...` (only `config` package has tests; no DB integration tests run locally).
+Tests: `go test ./...`
+
+## Kubernetes deployment
+
+See `deploy/k8s/` for example YAML manifests: server Deployment + Service + ServiceAccount with RBAC for in-cluster K8s access, plus an example agent Deployment. The server autodetects in-cluster auth via `KUBERNETES_SERVICE_HOST` when `VDI_KUBERNETES_MODE=auto`; set `VDI_KUBERNETES_MODE=incluster` to force service-account auth or `outofcluster` with `VDI_KUBECONFIG` to use a kubeconfig.
+
+Apply the server stack:
+
+```
+kubectl apply -f deploy/k8s/server.yaml
+```
+
+Create a secret for Proxmox credentials and the agent token before applying:
+
+```
+kubectl create secret generic vdi-proxmox \
+  --from-literal=user=root@pam \
+  --from-literal=password='<proxmox-password>'
+kubectl create secret generic vdi-agent \
+  --from-literal=agent-token='<shared-agent-token>'
+```
 
 ## Data model
 
@@ -63,17 +98,20 @@ All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migr
 
 ## API endpoints
 
-- `GET/POST /games`
+- `GET/POST /games` — `PUT /games/{id}` (admin) updates `library_path`
+- `GET /me` — current user id/username/role/age
 - `GET/POST/DELETE /sessions`
-- `POST /sessions/{id}/override`
+- `POST /sessions/{id}/override` — VM config override
 - `GET /users` (admin)
 - `GET /config`
 - `GET /health`
+- `POST /agent/vm/{vmid}/start`, `POST /agent/vm/{vmid}/stop`, `GET /agent/vm/{vmid}/config` (agent token auth)
 
 ## Security model
 
 - OIDC/JWKS verification; empty `VDI_OIDC_ISSUER` = dev-only mode that accepts any bearer token. Do not ship with it empty.
 - RBAC middleware (anonymous/gamer/admin)
+- Agent token auth (`Bearer VDI_AGENT_TOKEN`) on `/agent/vm/*` endpoints — agents never talk to Proxmox directly
 - PEGI age gating
 - mTLS server↔agent
 - SMB mount `nosuid,noexec`
@@ -86,3 +124,6 @@ All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migr
 - `server` binary at repo root is a build artifact; gitignored along with `web/node_modules` and `web/dist`.
 - Frontend build output goes to `web/dist`; do not commit it.
 - No local DB is available, so integration tests cannot run without `VDI_DATABASE_DSN`.
+- Empty `VDI_OIDC_ISSUER` disables real OIDC verification (dev-only). Do not ship with it empty.
+- When running the server in Kubernetes with `VDI_KUBERNETES_MODE=incluster`, the pod's ServiceAccount needs RBAC to list/patch Talos nodes.
+- Every agent–VM interaction on the Proxmox side goes through the server (`/agent/vm/*`); agents must not call Proxmox directly.

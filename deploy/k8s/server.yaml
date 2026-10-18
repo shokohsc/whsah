@@ -1,0 +1,213 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vdi-server
+  labels:
+    app: vdi
+    component: server
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vdi-server-talos
+  labels:
+    app: vdi
+    component: server
+rules:
+  # Talos node management: cordon/drain/delete via k8s client-go.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vdi-server-talos
+  labels:
+    app: vdi
+    component: server
+subjects:
+  - kind: ServiceAccount
+    name: vdi-server
+roleRef:
+  kind: Role
+  name: vdi-server-talos
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vdi-proxmox
+  labels:
+    app: vdi
+    component: server
+type: Opaque
+stringData:
+  # VDI_PROXMOX_USER
+  user: "root@pam"
+  # VDI_PROXMOX_PASSWORD
+  password: "<CHANGE_ME>"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vdi-agent
+  labels:
+    app: vdi
+    component: server
+type: Opaque
+stringData:
+  # VDI_AGENT_TOKEN — shared bearer token agents send to /agent/vm/*
+  agent-token: "<CHANGE_ME>"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vdi-config
+  labels:
+    app: vdi
+    component: server
+data:
+  VDI_DATABASE_DSN: "postgres://vdi:vdi@postgres:5432/vdi?sslmode=disable"
+  VDI_LISTEN_ADDR: ":8080"
+  VDI_PROXMOX_BASE: "https://proxmox.example.com:8006"
+  VDI_PROXMOX_NODE: "pve-01"
+  VDI_PROXMOX_AUTH_MODE: "token"
+  # VDI_PROXMOX_TOKEN: "userid!tokenid=secret"  # set below via secret ref if using token mode
+  VDI_LIBRARY_PATH: "/mnt/games"
+  VDI_LOKI_URL: "http://loki:3100"
+  VDI_KUBERNETES_MODE: "incluster"
+  VDI_OIDC_ISSUER: "https://oidc.example.com"
+  VDI_OIDC_CLIENT_ID: "vdi-server"
+  VDI_BACKUP_INTERVAL: "168h"
+  VDI_VM_DELETION_DELAY: "720h"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vdi-server
+  labels:
+    app: vdi
+    component: server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vdi
+      component: server
+  template:
+    metadata:
+      labels:
+        app: vdi
+        component: server
+    spec:
+      serviceAccountName: vdi-server
+      containers:
+        - name: server
+          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi:server
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: VDI_DATABASE_DSN
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_DATABASE_DSN
+            - name: VDI_LISTEN_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_LISTEN_ADDR
+            - name: VDI_PROXMOX_BASE
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_PROXMOX_BASE
+            - name: VDI_PROXMOX_NODE
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_PROXMOX_NODE
+            - name: VDI_PROXMOX_AUTH_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_PROXMOX_AUTH_MODE
+            - name: VDI_PROXMOX_USER
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-proxmox
+                  key: user
+            - name: VDI_PROXMOX_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-proxmox
+                  key: password
+            - name: VDI_LIBRARY_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_LIBRARY_PATH
+            - name: VDI_LOKI_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_LOKI_URL
+            - name: VDI_KUBERNETES_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_KUBERNETES_MODE
+            - name: VDI_OIDC_ISSUER
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_OIDC_ISSUER
+            - name: VDI_OIDC_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_OIDC_CLIENT_ID
+            - name: VDI_BACKUP_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_BACKUP_INTERVAL
+            - name: VDI_VM_DELETION_DELAY
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_VM_DELETION_DELAY
+            - name: VDI_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-agent
+                  key: agent-token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vdi-server
+  labels:
+    app: vdi
+    component: server
+spec:
+  type: ClusterIP
+  selector:
+    app: vdi
+    component: server
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http

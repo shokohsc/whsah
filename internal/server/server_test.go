@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"selfhosted-gaming-vdi/config"
+	"selfhosted-gaming-vdi/internal/proxmox"
 	"selfhosted-gaming-vdi/models"
 )
 
@@ -71,7 +72,7 @@ func reqBody(v any) *strings.Reader {
 
 func TestHealth(t *testing.T) {
 	db := testDB(t)
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 	r := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
 	srv.handleHealth(w, r)
@@ -82,7 +83,7 @@ func TestHealth(t *testing.T) {
 
 func TestConfig(t *testing.T) {
 	db := testDB(t)
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 	r := httptest.NewRequest(http.MethodGet, "/config", nil)
 	w := httptest.NewRecorder()
 	srv.handleConfig(w, r)
@@ -101,7 +102,7 @@ func TestConfig(t *testing.T) {
 func TestListGames(t *testing.T) {
 	db := testDB(t)
 	seedGames(t, db)
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 	r := httptest.NewRequest(http.MethodGet, "/games", nil)
 	w := httptest.NewRecorder()
 	srv.handleListGames(w, r)
@@ -121,7 +122,7 @@ func TestCreateSessionAgeGate(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
 	seedGames(t, db)
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 
 	// adult (30) can play 18-rated game
 	r := httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{"game_id": 3, "vm_id": "vm-1"}))
@@ -155,7 +156,7 @@ func TestCreateSessionVMConfigOverride(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
 	seedGames(t, db)
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 
 	r := httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{
 		"game_id":        1,
@@ -193,7 +194,7 @@ func TestListSessionsFiltersByUser(t *testing.T) {
 	// dev-user owns session 1, admin owns session 2
 	db.Create(&models.Session{UserID: 1, GameID: 1, VMID: "vm-a"})
 	db.Create(&models.Session{UserID: 3, GameID: 2, VMID: "vm-b"})
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 
 	r := httptest.NewRequest(http.MethodGet, "/sessions", nil)
 	r = withUserContext(r, "dev-user")
@@ -223,7 +224,7 @@ func TestDeleteSessionOwnership(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
 	db.Create(&models.Session{UserID: 1, GameID: 1, VMID: "vm-del"})
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 
 	// owner can delete
 	r := httptest.NewRequest(http.MethodDelete, "/sessions/1", nil)
@@ -259,7 +260,7 @@ func TestOverrideVMConfig(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
 	db.Create(&models.Session{UserID: 1, GameID: 1, VMID: "vm-ov"})
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 
 	r := httptest.NewRequest(http.MethodPost, "/sessions/1/override", reqBody(map[string]any{"cpu_cores": 16}))
 	r = withUserContext(r, "dev-user")
@@ -278,7 +279,7 @@ func TestOverrideVMConfig(t *testing.T) {
 func TestCreateGameRequiresAdmin(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
-	srv := New(db, NewVerifier(OIDC{}), config.Default())
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -310,5 +311,92 @@ func TestCreateGameRequiresAdmin(t *testing.T) {
 	srv.handleCreateGame(w, r)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("handleCreateGame status = %d, want 201; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAgentVMProxyRequiresToken(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	r := httptest.NewRequest(http.MethodPost, "/agent/vm/100/start", nil)
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("no token status = %d, want 401; body=%s", w.Code, w.Body.String())
+	}
+
+	r = httptest.NewRequest(http.MethodPost, "/agent/vm/100/start", nil)
+	r.Header.Set("Authorization", "Bearer wrong-token")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token status = %d, want 401; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAgentVMProxyStartStopConfig(t *testing.T) {
+	db := testDB(t)
+	var started, stopped, configRequested []string
+	pxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		vmid := ""
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i] == "qemu" && i+1 < len(parts) {
+				vmid = parts[i+1]
+				break
+			}
+		}
+		switch {
+		case strings.Contains(r.URL.Path, "/status/start"):
+			started = append(started, vmid)
+		case strings.Contains(r.URL.Path, "/status/stop"):
+			stopped = append(stopped, vmid)
+		case strings.Contains(r.URL.Path, "/qemu/") && strings.Contains(r.URL.Path, "/config"):
+			configRequested = append(configRequested, vmid)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"vmid": 100, "cores": 4, "memory": 8192, "size": 128}})
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer pxSrv.Close()
+
+	px := proxmox.New(pxSrv.URL, "pve-node", "token")
+	srv := New(db, NewVerifier(OIDC{}), px, config.Config{AgentToken: "agent-secret"})
+
+	// start
+	r := httptest.NewRequest(http.MethodPost, "/agent/vm/100/start", nil)
+	r.Header.Set("Authorization", "Bearer agent-secret")
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("start status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+
+	// stop
+	r = httptest.NewRequest(http.MethodPost, "/agent/vm/100/stop", nil)
+	r.Header.Set("Authorization", "Bearer agent-secret")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("stop status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+
+	// config
+	r = httptest.NewRequest(http.MethodGet, "/agent/vm/100/config", nil)
+	r.Header.Set("Authorization", "Bearer agent-secret")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("config status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	if len(started) != 1 || started[0] != "100" {
+		t.Fatalf("unexpected started: %v", started)
+	}
+	if len(stopped) != 1 || stopped[0] != "100" {
+		t.Fatalf("unexpected stopped: %v", stopped)
+	}
+	if len(configRequested) != 1 || configRequested[0] != "100" {
+		t.Fatalf("unexpected config requested: %v", configRequested)
 	}
 }

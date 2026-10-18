@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,17 +11,19 @@ import (
 	"gorm.io/gorm"
 
 	"selfhosted-gaming-vdi/config"
+	"selfhosted-gaming-vdi/internal/proxmox"
 	"selfhosted-gaming-vdi/models"
 )
 
 type Server struct {
 	db      *gorm.DB
 	verifier *Verifier
+	px      *proxmox.Client
 	cfg     config.Config
 }
 
-func New(db *gorm.DB, verifier *Verifier, cfg config.Config) *Server {
-	return &Server{db: db, verifier: verifier, cfg: cfg}
+func New(db *gorm.DB, verifier *Verifier, px *proxmox.Client, cfg config.Config) *Server {
+	return &Server{db: db, verifier: verifier, px: px, cfg: cfg}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -29,11 +32,19 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /config", s.handleConfig)
 	mux.HandleFunc("GET /games", s.handleListGames)
 	mux.Handle("POST /games", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateGame)))
+	mux.Handle("PUT /games/{id}", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleUpdateGame)))
 	mux.Handle("GET /sessions", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleListSessions)))
 	mux.Handle("POST /sessions", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleCreateSession)))
 	mux.Handle("DELETE /sessions/", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleDeleteSession)))
 	mux.Handle("POST /sessions/{id}/override", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleOverrideVMConfig)))
 	mux.Handle("GET /users", AuthMiddleware(s.verifier)(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListUsers))))
+	mux.Handle("GET /me", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleMe)))
+
+	// Agent-only endpoints: every agent-to-Proxmox interaction goes through
+	// the server. Agents authenticate with the shared AgentToken.
+	mux.Handle("POST /agent/vm/{vmid}/start", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMStart)))
+	mux.Handle("POST /agent/vm/{vmid}/stop", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMStop)))
+	mux.Handle("GET /agent/vm/{vmid}/config", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMConfig)))
 	return mux
 }
 
@@ -90,6 +101,36 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusCreated, g)
+}
+
+func (s *Server) handleUpdateGame(w http.ResponseWriter, r *http.Request) {
+	id, err := gameIDFromPath(r)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+	var g models.Game
+	if err := s.db.First(&g, id).Error; err != nil {
+		http.Error(w, `{"error":"game not found"}`, http.StatusNotFound)
+		return
+	}
+	var req struct {
+		LibraryPath string `json:"library_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.LibraryPath == "" {
+		http.Error(w, `{"error":"library_path required"}`, http.StatusBadRequest)
+		return
+	}
+	g.LibraryPath = req.LibraryPath
+	if err := s.db.Save(&g).Error; err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, g)
 }
 
 func currentUser(s *Server, r *http.Request) (models.User, bool) {
@@ -258,6 +299,20 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, out)
 }
 
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	u, ok := currentUser(s, r)
+	if !ok {
+		http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"id":       u.ID,
+		"username": u.Username,
+		"role":     u.Role,
+		"age":      u.Age,
+	})
+}
+
 func (s *Server) requireRole(roles ...models.Role) func(http.Handler) http.Handler {
 	allowed := map[models.Role]bool{}
 	for _, role := range roles {
@@ -275,9 +330,86 @@ func (s *Server) requireRole(roles ...models.Role) func(http.Handler) http.Handl
 	}
 }
 
+// requireAgentToken authenticates agents via the shared AgentToken bearer
+// token. Only agents may call the VM proxy endpoints.
+func (s *Server) requireAgentToken(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := bearerToken(r)
+		if token == "" || token != s.cfg.AgentToken {
+			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) handleAgentVMStart(w http.ResponseWriter, r *http.Request) {
+	vmid := r.PathValue("vmid")
+	if vmid == "" {
+		http.Error(w, `{"error":"missing vmid"}`, http.StatusBadRequest)
+		return
+	}
+	if s.px == nil {
+		http.Error(w, `{"error":"proxmox not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+	if err := s.px.Start(vmid); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAgentVMStop(w http.ResponseWriter, r *http.Request) {
+	vmid := r.PathValue("vmid")
+	if vmid == "" {
+		http.Error(w, `{"error":"missing vmid"}`, http.StatusBadRequest)
+		return
+	}
+	if s.px == nil {
+		http.Error(w, `{"error":"proxmox not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+	if err := s.px.Stop(vmid); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleAgentVMConfig(w http.ResponseWriter, r *http.Request) {
+	vmid := r.PathValue("vmid")
+	if vmid == "" {
+		http.Error(w, `{"error":"missing vmid"}`, http.StatusBadRequest)
+		return
+	}
+	if s.px == nil {
+		http.Error(w, `{"error":"proxmox not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+	cfg, err := s.px.GetConfig(vmid)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, cfg)
+}
+
 func sessionIDFromPath(r *http.Request) (uint, error) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 2 || parts[0] != "sessions" {
+		return 0, strconv.ErrSyntax
+	}
+	n, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return uint(n), nil
+}
+
+func gameIDFromPath(r *http.Request) (uint, error) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 2 || parts[0] != "games" {
 		return 0, strconv.ErrSyntax
 	}
 	n, err := strconv.ParseUint(parts[1], 10, 64)

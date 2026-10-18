@@ -1,0 +1,100 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vdi-agent-creds
+  labels:
+    app: vdi
+    component: agent
+type: Opaque
+stringData:
+  # VDI_AGENT_TOKEN — must match the server's VDI_AGENT_TOKEN
+  agent-token: "<CHANGE_ME>"
+  # VDI_SMB_CREDS — SMB mount credentials (optional)
+  smb-creds: "<CHANGE_ME>"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vdi-agent-config
+  labels:
+    app: vdi
+    component: agent
+data:
+  VDI_SERVER_URL: "http://vdi-server:8080"
+  VDI_VM_ID: "<VM_ID>"
+  VDI_GAME_LIB: "/mnt/games"
+  VDI_SMB_SHARE: "//smshost/games"
+  VDI_IDLE_SECS: "1800"
+  VDI_LOKI_URL: "http://loki:3100"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vdi-agent
+  labels:
+    app: vdi
+    component: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vdi
+      component: agent
+  template:
+    metadata:
+      labels:
+        app: vdi
+        component: agent
+    spec:
+      containers:
+        - name: agent
+          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi:agent
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: VDI_SERVER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-agent-config
+                  key: VDI_SERVER_URL
+            - name: VDI_VM_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-agent-config
+                  key: VDI_VM_ID
+            - name: VDI_GAME_LIB
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-agent-config
+                  key: VDI_GAME_LIB
+            - name: VDI_SMB_SHARE
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-agent-config
+                  key: VDI_SMB_SHARE
+            - name: VDI_SMB_CREDS
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-agent-creds
+                  key: smb-creds
+            - name: VDI_IDLE_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-agent-config
+                  key: VDI_IDLE_SECS
+            - name: VDI_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-agent-creds
+                  key: agent-token
+            - name: VDI_LOKI_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-agent-config
+                  key: VDI_LOKI_URL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

@@ -120,3 +120,44 @@ func TestStartStopDelete(t *testing.T) {
 		t.Fatalf("unexpected deleted: %v", deleted)
 	}
 }
+
+func TestPasswordAuth(t *testing.T) {
+	var ticketRequested, csrfChecked bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api2/json/access/ticket":
+			ticketRequested = true
+			if r.Method != http.MethodPost {
+				http.Error(w, "bad method", http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]string{
+				"ticket":               "test-ticket",
+				"CSRFPreventionToken":  "test-csrf",
+			}})
+		case "/api2/json/nodes/pve-node/qemu":
+			csrfChecked = r.Header.Get("Cookie") == "PVEAuthCookie=test-ticket"
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []VM{}})
+		default:
+			http.Error(w, "bad path", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewPassword(srv.URL, "pve-node", "user@pve", "secret")
+	vms, err := client.ListVMs()
+	if err != nil {
+		t.Fatalf("list vms: %v", err)
+	}
+	if !ticketRequested {
+		t.Fatal("ticket endpoint not called")
+	}
+	if !csrfChecked {
+		t.Fatal("csrf cookie not sent")
+	}
+	if len(vms) != 0 {
+		t.Fatalf("expected no vms, got %d", len(vms))
+	}
+}
