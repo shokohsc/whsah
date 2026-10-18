@@ -59,12 +59,12 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta-server
         with:
-          images: ghcr.io/${{ github.repository_owner }}/selfhosted-gaming-vdi-server
+          images: ghcr.io/${{ github.repository_owner }}/whsah-server
           tags: |
             type=sha
             type=ref,event=tag
           labels: |
-            org.opencontainers.image.title=selfhosted-gaming-vdi-server
+            org.opencontainers.image.title=whsah-server
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
       - uses: docker/build-push-action@v6
@@ -89,12 +89,12 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta-web
         with:
-          images: ghcr.io/${{ github.repository_owner }}/selfhosted-gaming-vdi-web
+          images: ghcr.io/${{ github.repository_owner }}/whsah-web
           tags: |
             type=sha
             type=ref,event=tag
           labels: |
-            org.opencontainers.image.title=selfhosted-gaming-vdi-web
+            org.opencontainers.image.title=whsah-web
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
       - uses: docker/build-push-action@v6
