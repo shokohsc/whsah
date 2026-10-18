@@ -35,11 +35,6 @@ jobs:
             goarch: amd64
             artifact: agent-windows-amd64.exe
             path: ./cmd/agent
-          - binary: server
-            goos: linux
-            goarch: amd64
-            artifact: server-linux-amd64
-            path: ./cmd/server
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -51,7 +46,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}
 
-  build-push-image:
+  build-server-image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,24 +56,53 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.CR_PAT || secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
-        # Set CR_PAT (or GHCR_TOKEN) as a repo secret; falls back to GITHUB_TOKEN.
       - uses: docker/metadata-action@v5
-        id: meta
+        id: meta-server
         with:
-          images: ghcr.io/${{ github.repository_owner }}/selfhosted-gaming-vdi
+          images: ghcr.io/${{ github.repository_owner }}/selfhosted-gaming-vdi-server
           tags: |
             type=sha
             type=ref,event=tag
           labels: |
-            org.opencontainers.image.title=selfhosted-gaming-vdi
+            org.opencontainers.image.title=selfhosted-gaming-vdi-server
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta-server.outputs.tags }}
+          labels: ${{ steps.meta-server.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-web-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.CR_PAT || secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta-web
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/selfhosted-gaming-vdi-web
+          tags: |
+            type=sha
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.title=selfhosted-gaming-vdi-web
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: web
+          push: true
+          tags: ${{ steps.meta-web.outputs.tags }}
+          labels: ${{ steps.meta-web.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
