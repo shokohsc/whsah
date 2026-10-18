@@ -4,7 +4,7 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 
 ## Tech stack
 
-- Go server + Go agent (module `selfhosted-gaming-vdi`, go 1.26.0)
+- Go server + Go agent + Go worker (module `selfhosted-gaming-vdi`, go 1.26.0)
 - Vue 3 + Vite + Bulma frontend (built to `web/dist`)
 - PostgreSQL via GORM (`gorm.io/gorm`, `gorm.io/driver/postgres`)
 - Proxmox cluster (VM host)
@@ -17,12 +17,13 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 
 ## Architecture boundaries
 
-- `internal/server` — OIDC JWT verification (JWKS), RBAC middleware, REST API (`/games`, `/sessions`, `/sessions/{id}/override`, `/users`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
+- `internal/server` — OIDC JWT verification (JWKS), RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
 - `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
 - `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
 - `internal/backup` — periodic backup tick + VM deletion after `last_user_session + delay`
 - `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown, Loki logging, VM ops via server only (never direct Proxmox)
 - `internal/firewall` — ephemeral co-op pinholes with TTL
+- `internal/worker` — PostgreSQL-backed job queue: claims pending game jobs (config generation, metadata retrieval) and writes results back to `Game`
 
 ## Quickstart
 
@@ -57,11 +58,17 @@ Agent env vars:
 - `VDI_AGENT_TOKEN` — bearer token sent to server agent endpoints
 - `VDI_LOKI_URL` — remote Loki endpoint for agent logs (optional)
 
+Worker env vars (`cmd/worker`):
+
+- `VDI_DATABASE_DSN` — PostgreSQL connection string (queue + game state; required)
+- `VDI_METADATA_URL` — HTTP metadata source for `metadata` jobs: `GET {VDI_METADATA_URL}/games?title={title}` returns the metadata JSON body (empty = metadata retrieval fails as "not configured")
+
 Build, run, frontend:
 
 ```
 go build ./...
 go run ./cmd/server       # HTTP API, backup scheduler/VM-deletion service, Proxmox + Kubernetes clients
+go run ./cmd/worker       # consumes game job queue (config generation, metadata retrieval) from PostgreSQL
 go run ./cmd/agent        # runs inside a VM: registration, streaming, gamesaves, SMB mount, idle shutdown
 cd web && npm install && npm run build
 ```
@@ -70,12 +77,18 @@ Tests: `go test ./...`
 
 ## Kubernetes deployment
 
-See `deploy/k8s/` for example YAML manifests: server Deployment + Service + ServiceAccount with RBAC for in-cluster K8s access, plus an example agent Deployment. The server autodetects in-cluster auth via `KUBERNETES_SERVICE_HOST` when `VDI_KUBERNETES_MODE=auto`; set `VDI_KUBERNETES_MODE=incluster` to force service-account auth or `outofcluster` with `VDI_KUBECONFIG` to use a kubeconfig.
+See `deploy/k8s/` for example YAML manifests: server Deployment + Service + ServiceAccount with RBAC for in-cluster K8s access, an example agent Deployment, and a worker Deployment that consumes the PostgreSQL game job queue. The server autodetects in-cluster auth via `KUBERNETES_SERVICE_HOST` when `VDI_KUBERNETES_MODE=auto`; set `VDI_KUBERNETES_MODE=incluster` to force service-account auth or `outofcluster` with `VDI_KUBECONFIG` to use a kubeconfig.
 
 Apply the server stack:
 
 ```
 kubectl apply -f deploy/k8s/server.yaml
+```
+
+Apply the game job worker (shares the same PostgreSQL database as the server):
+
+```
+kubectl apply -f deploy/k8s/worker.yaml
 ```
 
 Create a secret for Proxmox credentials and the agent token before applying:
@@ -93,12 +106,16 @@ kubectl create secret generic vdi-agent \
 - `User` — roles `anonymous` / `gamer` / `admin`
 - `Game` — title, metadata JSON, `library_path`, embedded `VMConfig` (`cpu_cores`, `ram_size` MB, `disk_size` GB), `pegi_rating`
 - `Session` — user/game/vm, `backups`, `last_user_session`, per-session VM config overrides
+- `GameJob` — queued work on a game: `kind` (`config` / `metadata`), `status` (`pending` / `processing` / `done` / `failed`), `payload`, `result`, `error`, `attempts`. The queue lives in PostgreSQL, so any number of workers can share it.
 
 All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migrate` (GORM AutoMigrate).
 
 ## API endpoints
 
 - `GET/POST /games` — `PUT /games/{id}` (admin) updates `library_path`
+- `POST /games/{id}/jobs` (admin) — enqueue a game job (`kind`: `config` or `metadata`, optional `payload`); returns `202` with the queued job
+- `GET /games/{id}/jobs` (admin) — list a game's jobs
+- `GET /jobs/{id}` — poll a job's `status`, `result`, `error`
 - `GET /me` — current user id/username/role/age
 - `GET/POST/DELETE /sessions`
 - `POST /sessions/{id}/override` — VM config override
@@ -106,6 +123,16 @@ All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migr
 - `GET /config`
 - `GET /health`
 - `POST /agent/vm/{vmid}/start`, `POST /agent/vm/{vmid}/stop`, `GET /agent/vm/{vmid}/config` (agent token auth)
+
+## Game job queue
+
+Games are configured and enriched asynchronously through a PostgreSQL-backed queue, so slow or external work never blocks the API:
+
+1. An admin enqueues a job: `POST /games/{id}/jobs` with `kind` = `config` or `metadata` (and an optional `payload`).
+2. One or more `cmd/worker` processes claim pending jobs atomically (`status: pending` → `processing`) directly from PostgreSQL, so workers can be scaled horizontally.
+3. `config` jobs generate the game's `VMConfig` — from the job `payload` when provided, otherwise derived from the PEGI rating — and write it back to the `Game` row.
+4. `metadata` jobs retrieve metadata from `VDI_METADATA_URL` (`GET {VDI_METADATA_URL}/games?title={title}`) and write it to `Game.metadata`.
+5. Results land in `GameJob.result`, failures in `GameJob.error`; clients poll `GET /jobs/{id}`.
 
 ## Security model
 

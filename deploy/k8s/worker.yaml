@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vdi-worker-config
+  labels:
+    app: vdi
+    component: worker
+data:
+  VDI_DATABASE_DSN: "postgres://vdi:vdi@postgres:5432/vdi?sslmode=disable"
+  # VDI_METADATA_URL — HTTP metadata source for `metadata` jobs:
+  #   GET {VDI_METADATA_URL}/games?title={title} returns the metadata JSON body.
+  # Leave empty to fail metadata jobs as "not configured".
+  VDI_METADATA_URL: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vdi-worker
+  labels:
+    app: vdi
+    component: worker
+spec:
+  # Any number of replicas is safe: jobs are claimed atomically in PostgreSQL.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vdi
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: vdi
+        component: worker
+    spec:
+      containers:
+        - name: worker
+          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi:worker
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: VDI_DATABASE_DSN
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-worker-config
+                  key: VDI_DATABASE_DSN
+            - name: VDI_METADATA_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-worker-config
+                  key: VDI_METADATA_URL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

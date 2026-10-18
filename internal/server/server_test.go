@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 
 	"selfhosted-gaming-vdi/config"
 	"selfhosted-gaming-vdi/internal/proxmox"
+	"selfhosted-gaming-vdi/internal/worker"
 	"selfhosted-gaming-vdi/models"
 )
 
@@ -27,7 +29,7 @@ func testDB(t *testing.T) *gorm.DB {
 		t.Fatalf("db.DB: %v", err)
 	}
 	sqlDB.SetMaxOpenConns(1)
-	if err := db.AutoMigrate(&models.User{}, &models.Game{}, &models.Session{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.Game{}, &models.Session{}, &models.GameJob{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db
@@ -398,5 +400,171 @@ func TestAgentVMProxyStartStopConfig(t *testing.T) {
 	}
 	if len(configRequested) != 1 || configRequested[0] != "100" {
 		t.Fatalf("unexpected config requested: %v", configRequested)
+	}
+}
+
+func TestEnqueueGameJob(t *testing.T) {
+	db := testDB(t)
+	seedGames(t, db)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	// unknown kind -> 400
+	r := httptest.NewRequest(http.MethodPost, "/games/1/jobs", reqBody(map[string]any{"kind": "bogus"}))
+	r = withUserContext(r, "admin")
+	w := httptest.NewRecorder()
+	srv.handleEnqueueGameJob(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown kind status = %d, want 400; body=%s", w.Code, w.Body.String())
+	}
+
+	// missing game -> 404
+	r = httptest.NewRequest(http.MethodPost, "/games/999/jobs", reqBody(map[string]any{"kind": "config"}))
+	r = withUserContext(r, "admin")
+	w = httptest.NewRecorder()
+	srv.handleEnqueueGameJob(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("missing game status = %d, want 404; body=%s", w.Code, w.Body.String())
+	}
+
+	// config job with explicit payload -> 202
+	r = httptest.NewRequest(http.MethodPost, "/games/2/jobs", reqBody(map[string]any{
+		"kind":    "config",
+		"payload": map[string]any{"cpu_cores": 4, "ram_size": 8192, "disk_size": 128},
+	}))
+	r = withUserContext(r, "admin")
+	w = httptest.NewRecorder()
+	srv.handleEnqueueGameJob(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("config job status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	var job models.GameJob
+	if err := json.Unmarshal(w.Body.Bytes(), &job); err != nil {
+		t.Fatalf("decode job: %v", err)
+	}
+	if job.GameID != 2 || job.Kind != models.JobKindConfig || job.Status != models.JobStatusPending {
+		t.Fatalf("unexpected job: %+v", job)
+	}
+	if !strings.Contains(job.Payload, "cpu_cores") {
+		t.Fatalf("payload not stored: %q", job.Payload)
+	}
+
+	// metadata job -> 202
+	r = httptest.NewRequest(http.MethodPost, "/games/1/jobs", reqBody(map[string]any{"kind": "metadata"}))
+	r = withUserContext(r, "admin")
+	w = httptest.NewRecorder()
+	srv.handleEnqueueGameJob(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("metadata job status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+
+	var stored models.GameJob
+	if err := db.First(&stored, job.ID).Error; err != nil {
+		t.Fatalf("stored job: %v", err)
+	}
+	if stored.Status != models.JobStatusPending {
+		t.Fatalf("expected pending, got %s", stored.Status)
+	}
+}
+
+func TestListGameJobs(t *testing.T) {
+	db := testDB(t)
+	seedGames(t, db)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	worker.Enqueue(db, 1, models.JobKindConfig, nil)
+	worker.Enqueue(db, 1, models.JobKindMetadata, nil)
+	worker.Enqueue(db, 2, models.JobKindConfig, nil)
+
+	r := httptest.NewRequest(http.MethodGet, "/games/1/jobs", nil)
+	r = withUserContext(r, "admin")
+	w := httptest.NewRecorder()
+	srv.handleListGameJobs(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list jobs status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var jobs []models.GameJob
+	if err := json.Unmarshal(w.Body.Bytes(), &jobs); err != nil {
+		t.Fatalf("decode jobs: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs for game 1, got %d", len(jobs))
+	}
+}
+
+func TestGetJob(t *testing.T) {
+	db := testDB(t)
+	seedGames(t, db)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+	job, err := worker.Enqueue(db, 1, models.JobKindConfig, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// invalid id
+	r := httptest.NewRequest(http.MethodGet, "/jobs/abc", nil)
+	r = withUserContext(r, "dev-user")
+	w := httptest.NewRecorder()
+	srv.handleGetJob(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid id status = %d, want 400", w.Code)
+	}
+
+	// missing job
+	r = httptest.NewRequest(http.MethodGet, "/jobs/9999", nil)
+	r = withUserContext(r, "dev-user")
+	w = httptest.NewRecorder()
+	srv.handleGetJob(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("missing job status = %d, want 404", w.Code)
+	}
+
+	// found
+	r = httptest.NewRequest(http.MethodGet, "/jobs/"+strconv.Itoa(int(job.ID)), nil)
+	r = withUserContext(r, "dev-user")
+	w = httptest.NewRecorder()
+	srv.handleGetJob(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get job status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var got models.GameJob
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode job: %v", err)
+	}
+	if got.ID != job.ID || got.Kind != models.JobKindConfig {
+		t.Fatalf("unexpected job: %+v", got)
+	}
+}
+
+func TestJobRoutesAuth(t *testing.T) {
+	db := testDB(t)
+	seedUsers(t, db)
+	seedGames(t, db)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+	job, _ := worker.Enqueue(db, 1, models.JobKindConfig, nil)
+
+	// POST /games/{id}/jobs requires admin (gamer forbidden, no token forbidden)
+	r := httptest.NewRequest(http.MethodPost, "/games/1/jobs", nil)
+	r = withUserContext(r, "dev-user")
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("gamer enqueue status = %d, want 403", w.Code)
+	}
+
+	// GET /jobs/{id} requires a token
+	r = httptest.NewRequest(http.MethodGet, "/jobs/"+strconv.Itoa(int(job.ID)), nil)
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("no token job status = %d, want 401", w.Code)
+	}
+
+	// GET /jobs/{id} with a token succeeds (dev mode accepts any token)
+	r = httptest.NewRequest(http.MethodGet, "/jobs/"+strconv.Itoa(int(job.ID)), nil)
+	r.Header.Set("Authorization", "Bearer any")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("token job status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 }
