@@ -1,0 +1,56 @@
+package firewall
+
+import (
+	"fmt"
+	"log"
+	"os/exec"
+	"sync"
+	"time"
+)
+
+// Rule is an ephemeral co-op firewall pinhole tied to a session with a TTL.
+type Rule struct {
+	SessionID string
+	CIDR      string
+	Port      uint16
+	Expires   time.Time
+}
+
+// Manager tracks ephemeral rules and applies them via iptables.
+type Manager struct {
+	mu   sync.Mutex
+	rules map[string]Rule
+}
+
+func New() *Manager {
+	return &Manager{rules: map[string]Rule{}}
+}
+
+// Add inserts a default-deny pinhole for the session, auto-removed after ttl.
+func (m *Manager) Add(sessionID, cidr string, port uint16, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := exec.Command("iptables", "-I", "INPUT", "-s", cidr, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT").Run(); err != nil {
+		log.Printf("iptables add %s:%d: %v", cidr, port, err)
+	}
+	m.rules[sessionID] = Rule{SessionID: sessionID, CIDR: cidr, Port: port, Expires: time.Now().Add(ttl)}
+	go m.removeAfter(sessionID, ttl)
+	return nil
+}
+
+// Remove deletes the pinhole for a session.
+func (m *Manager) Remove(sessionID string) {
+	m.mu.Lock()
+	r, ok := m.rules[sessionID]
+	delete(m.rules, sessionID)
+	m.mu.Unlock()
+	if !ok {
+		return
+	}
+	_ = exec.Command("iptables", "-D", "INPUT", "-s", r.CIDR, "-p", "tcp", "--dport", fmt.Sprintf("%d", r.Port), "-j", "ACCEPT").Run()
+}
+
+func (m *Manager) removeAfter(sessionID string, ttl time.Duration) {
+	time.Sleep(ttl)
+	m.Remove(sessionID)
+}
