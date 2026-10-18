@@ -1,13 +1,17 @@
 package models
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
 
 // Session is an active or finished user game session on a VM.
 type Session struct {
-	ID        uint        `gorm:"primaryKey" json:"id"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
-	DeletedAt *time.Time  `gorm:"index" json:"deleted_at,omitempty"`
+	ID        uint           `gorm:"primaryKey" json:"id"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 
 	UserID   uint   `gorm:"index;not null" json:"user_id"`
 	GameID   uint   `gorm:"index;not null" json:"game_id"`

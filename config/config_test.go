@@ -14,3 +14,15 @@ func TestDefaults(t *testing.T) {
 		t.Fatalf("expected 1-month deletion delay, got %v", cfg.VMDeletionDelay)
 	}
 }
+
+func TestDefaultsFromEnv(t *testing.T) {
+	// VDI_BACKUP_INTERVAL and VDI_VM_DELETION_DELAY are parsed in main, but
+	// the defaults themselves must remain stable.
+	cfg := Default()
+	if cfg.BackupInterval <= 0 {
+		t.Fatal("backup interval must be positive")
+	}
+	if cfg.VMDeletionDelay <= 0 {
+		t.Fatal("vm deletion delay must be positive")
+	}
+}

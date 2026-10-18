@@ -12,7 +12,7 @@ import (
 
 // Client manages Talos worker nodes via the Kubernetes API.
 type Client struct {
-	clientset *kubernetes.Clientset
+	clientset kubernetes.Interface
 }
 
 func New(kubeconfig string) (*Client, error) {
@@ -29,6 +29,11 @@ func New(kubeconfig string) (*Client, error) {
 		return nil, err
 	}
 	return &Client{clientset: clientset}, nil
+}
+
+// NewWithClientset builds a Client backed by an existing clientset (for tests).
+func NewWithClientset(cs kubernetes.Interface) *Client {
+	return &Client{clientset: cs}
 }
 
 // Cordon marks a node unschedulable.

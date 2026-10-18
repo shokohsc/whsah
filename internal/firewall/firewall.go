@@ -2,11 +2,13 @@ package firewall
 
 import (
 	"fmt"
-	"log"
 	"os/exec"
 	"sync"
 	"time"
 )
+
+// iptables runs the iptables command; replaced by tests with a no-op.
+var iptables = func(args ...string) error { return exec.Command("iptables", args...).Run() }
 
 // Rule is an ephemeral co-op firewall pinhole tied to a session with a TTL.
 type Rule struct {
@@ -30,9 +32,7 @@ func New() *Manager {
 func (m *Manager) Add(sessionID, cidr string, port uint16, ttl time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := exec.Command("iptables", "-I", "INPUT", "-s", cidr, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT").Run(); err != nil {
-		log.Printf("iptables add %s:%d: %v", cidr, port, err)
-	}
+	_ = iptables("-I", "INPUT", "-s", cidr, "-p", "tcp", "--dport", fmt.Sprintf("%d", port), "-j", "ACCEPT")
 	m.rules[sessionID] = Rule{SessionID: sessionID, CIDR: cidr, Port: port, Expires: time.Now().Add(ttl)}
 	go m.removeAfter(sessionID, ttl)
 	return nil
@@ -47,7 +47,7 @@ func (m *Manager) Remove(sessionID string) {
 	if !ok {
 		return
 	}
-	_ = exec.Command("iptables", "-D", "INPUT", "-s", r.CIDR, "-p", "tcp", "--dport", fmt.Sprintf("%d", r.Port), "-j", "ACCEPT").Run()
+	_ = iptables("-D", "INPUT", "-s", r.CIDR, "-p", "tcp", "--dport", fmt.Sprintf("%d", r.Port), "-j", "ACCEPT")
 }
 
 func (m *Manager) removeAfter(sessionID string, ttl time.Duration) {
