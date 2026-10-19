@@ -12,12 +12,12 @@ func TestVerifyDevModeEmptyIssuer(t *testing.T) {
 		t.Fatal("expected error for empty token in dev mode")
 	}
 	// any non-empty token -> dev-user
-	sub, err := v.Verify(context.Background(), "any-token")
+	id, err := v.Verify(context.Background(), "any-token")
 	if err != nil {
 		t.Fatalf("expected no error in dev mode, got: %v", err)
 	}
-	if sub != "dev-user" {
-		t.Fatalf("expected dev-user, got %q", sub)
+	if id.Subject != "dev-user" {
+		t.Fatalf("expected dev-user, got %q", id.Subject)
 	}
 }
 

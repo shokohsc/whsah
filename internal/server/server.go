@@ -1,13 +1,19 @@
 package server
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 
 	"selfhosted-gaming-vdi/config"
@@ -31,25 +37,116 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /config", s.handleConfig)
+	mux.HandleFunc("GET /auth/login", s.handleAuthLogin)
+	mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
 	mux.HandleFunc("GET /games", s.handleListGames)
 	mux.Handle("POST /games", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateGame)))
 	mux.Handle("PUT /games/{id}", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleUpdateGame)))
 	mux.Handle("POST /games/{id}/jobs", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleEnqueueGameJob)))
 	mux.Handle("GET /games/{id}/jobs", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListGameJobs)))
-	mux.Handle("GET /jobs/{id}", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleGetJob)))
-	mux.Handle("GET /sessions", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleListSessions)))
-	mux.Handle("POST /sessions", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleCreateSession)))
-	mux.Handle("DELETE /sessions/", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleDeleteSession)))
-	mux.Handle("POST /sessions/{id}/override", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleOverrideVMConfig)))
-	mux.Handle("GET /users", AuthMiddleware(s.verifier)(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListUsers))))
-	mux.Handle("GET /me", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleMe)))
+	mux.Handle("GET /jobs/{id}", s.auth(http.HandlerFunc(s.handleGetJob)))
+	mux.Handle("GET /sessions", s.auth(http.HandlerFunc(s.handleListSessions)))
+	mux.Handle("POST /sessions", s.auth(http.HandlerFunc(s.handleCreateSession)))
+	mux.Handle("DELETE /sessions/", s.auth(http.HandlerFunc(s.handleDeleteSession)))
+	mux.Handle("POST /sessions/{id}/override", s.auth(http.HandlerFunc(s.handleOverrideVMConfig)))
+	mux.Handle("GET /users", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListUsers))))
+	mux.Handle("PUT /users/{id}", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleUpdateUserRole))))
+	mux.Handle("GET /me", s.auth(http.HandlerFunc(s.handleMe)))
 
 	// Agent-only endpoints: every agent-to-Proxmox interaction goes through
 	// the server. Agents authenticate with the shared AgentToken.
 	mux.Handle("POST /agent/vm/{vmid}/start", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMStart)))
 	mux.Handle("POST /agent/vm/{vmid}/stop", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMStop)))
 	mux.Handle("GET /agent/vm/{vmid}/config", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMConfig)))
-	return mux
+	return s.withCORS(mux)
+}
+
+// withCORS allows the main-site browser origin to call the API hosted on the
+// api.<domain> subdomain. Empty FrontendOrigin disables CORS.
+func (s *Server) withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); s.cfg.FrontendOrigin != "" && origin == s.cfg.FrontendOrigin {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// auth requires a valid OIDC identity and auto-provisions the user on first
+// login, storing the identity in the request context under ctxUserKey.
+func (s *Server) auth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, err := s.verifier.Verify(r.Context(), bearerToken(r))
+		if err != nil {
+			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+			return
+		}
+		if _, err := s.ensureUser(id); err != nil {
+			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey, id)))
+	})
+}
+
+// ensureUser returns the stored user for an identity, creating it on first
+// login. OIDC subjects in AdminSubjects are provisioned (or promoted) to admin.
+func (s *Server) ensureUser(id Identity) (models.User, error) {
+	var u models.User
+	q := s.db.Where("username = ?", id.Subject)
+	if id.Email != "" {
+		q = q.Or("email = ?", id.Email)
+	}
+	err := q.First(&u).Error
+	if err == nil {
+		if s.isAdminSubject(id.Subject) && u.Role != models.RoleAdmin {
+			u.Role = models.RoleAdmin
+			if err := s.db.Save(&u).Error; err != nil {
+				return u, err
+			}
+		}
+		return u, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return u, err
+	}
+	email := id.Email
+	if email == "" {
+		email = id.Subject + "@oidc.local"
+	}
+	username := id.Username
+	if username == "" {
+		username = id.Subject
+	}
+	role := models.RoleGamer
+	if s.isAdminSubject(id.Subject) {
+		role = models.RoleAdmin
+	}
+	u = models.User{Username: username, Email: email, Age: s.cfg.DefaultAge, Role: role}
+	if err := s.db.Create(&u).Error; err != nil {
+		// Lost a provisioning race: return the row another request created.
+		if e := s.db.Where("username = ? OR email = ?", username, email).First(&u).Error; e == nil {
+			return u, nil
+		}
+		return u, err
+	}
+	return u, nil
+}
+
+func (s *Server) isAdminSubject(subject string) bool {
+	for _, a := range s.cfg.AdminSubjects {
+		if a == subject {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, v any) {
@@ -66,7 +163,91 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"backup_interval":   s.cfg.BackupInterval.String(),
 		"vm_deletion_delay": s.cfg.VMDeletionDelay.String(),
+		"oidc_issuer":       s.verifier.issuer,
+		"oidc_client_id":    s.verifier.clientID,
 	})
+}
+
+// oauth2Config builds the OIDC client config with the server's public redirect
+// URI and (optional) confidential client secret.
+func (s *Server) oauth2Config() *oauth2.Config {
+	oc := s.verifier.OAuth2()
+	oc.ClientSecret = s.cfg.OIDCClientSecret
+	oc.RedirectURL = strings.TrimRight(s.cfg.OIDCPublicURL, "/") + "/auth/callback"
+	return oc
+}
+
+// frontendLogin builds the frontend login route URL. The route and its token
+// travel after the URL fragment so the token is never sent to servers.
+func (s *Server) frontendLogin(errMsg, token string) string {
+	u := strings.TrimRight(s.cfg.FrontendOrigin, "/") + "/#/login"
+	if token != "" {
+		return u + "?token=" + url.QueryEscape(token)
+	}
+	if errMsg != "" {
+		return u + "?error=" + url.QueryEscape(errMsg)
+	}
+	return u
+}
+
+// handleAuthLogin starts the OIDC authorization code flow. In dev mode (no
+// issuer configured) it hands the frontend a dummy token directly.
+func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if s.verifier.issuer == "" {
+		http.Redirect(w, r, s.frontendLogin("", "dev-token"), http.StatusFound)
+		return
+	}
+	state, err := randomState()
+	if err != nil {
+		http.Error(w, `{"error":"state error"}`, http.StatusInternalServerError)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "vdi_oauth_state",
+		Value:    state,
+		Path:     "/auth",
+		HttpOnly: true,
+		Secure:   strings.HasPrefix(s.cfg.OIDCPublicURL, "https"),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   600,
+	})
+	http.Redirect(w, r, s.oauth2Config().AuthCodeURL(state), http.StatusFound)
+}
+
+// handleAuthCallback completes the flow: it validates the state cookie,
+// exchanges the code for tokens and redirects back to the frontend with the
+// ID token in the URL fragment.
+func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
+	state := r.URL.Query().Get("state")
+	cookie, err := r.Cookie("vdi_oauth_state")
+	if err != nil || cookie.Value == "" || cookie.Value != state {
+		http.Redirect(w, r, s.frontendLogin("invalid oauth state", ""), http.StatusFound)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "vdi_oauth_state", Value: "", Path: "/auth", MaxAge: -1})
+	if e := r.URL.Query().Get("error"); e != "" {
+		http.Redirect(w, r, s.frontendLogin(e, ""), http.StatusFound)
+		return
+	}
+	token, err := s.oauth2Config().Exchange(r.Context(), r.URL.Query().Get("code"))
+	if err != nil {
+		http.Redirect(w, r, s.frontendLogin("token exchange failed", ""), http.StatusFound)
+		return
+	}
+	idToken, _ := token.Extra("id_token").(string)
+	if idToken == "" {
+		http.Redirect(w, r, s.frontendLogin("no id_token in response", ""), http.StatusFound)
+		return
+	}
+	http.Redirect(w, r, s.frontendLogin("", idToken), http.StatusFound)
+}
+
+func randomState() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
@@ -197,9 +378,13 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func currentUser(s *Server, r *http.Request) (models.User, bool) {
-	sub := userID(r)
+	id := userID(r)
+	q := s.db.Where("username = ?", id.Subject)
+	if id.Email != "" {
+		q = q.Or("email = ?", id.Email)
+	}
 	var u models.User
-	if err := s.db.Where("username = ? OR email = ?", sub, sub).First(&u).Error; err != nil {
+	if err := q.First(&u).Error; err != nil {
 		return u, false
 	}
 	return u, true
@@ -342,24 +527,63 @@ func (s *Server) handleOverrideVMConfig(w http.ResponseWriter, r *http.Request) 
 	s.writeJSON(w, http.StatusOK, sess)
 }
 
+type userOut struct {
+	ID       uint        `json:"id"`
+	Username string      `json:"username"`
+	Email    string      `json:"email"`
+	Age      int         `json:"age"`
+	Role     models.Role `json:"role"`
+}
+
+func newUserOut(u models.User) userOut {
+	return userOut{ID: u.ID, Username: u.Username, Email: u.Email, Age: u.Age, Role: u.Role}
+}
+
 func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	var users []models.User
 	if err := s.db.Find(&users).Error; err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
-	type userOut struct {
-		ID       uint   `json:"id"`
-		Username string `json:"username"`
-		Email    string `json:"email"`
-		Age      int    `json:"age"`
-		Role     models.Role `json:"role"`
-	}
 	out := make([]userOut, len(users))
 	for i, u := range users {
-		out[i] = userOut{ID: u.ID, Username: u.Username, Email: u.Email, Age: u.Age, Role: u.Role}
+		out[i] = newUserOut(u)
 	}
 	s.writeJSON(w, http.StatusOK, out)
+}
+
+// handleUpdateUserRole lets an admin change a user's role, making the
+// anonymous/gamer/admin distinction meaningful.
+func (s *Server) handleUpdateUserRole(w http.ResponseWriter, r *http.Request) {
+	id, err := userIDFromPath(r)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Role models.Role `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
+	switch req.Role {
+	case models.RoleAnonymous, models.RoleGamer, models.RoleAdmin:
+	default:
+		http.Error(w, `{"error":"invalid role"}`, http.StatusBadRequest)
+		return
+	}
+	var u models.User
+	if err := s.db.First(&u, id).Error; err != nil {
+		http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
+		return
+	}
+	u.Role = req.Role
+	if err := s.db.Save(&u).Error; err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, newUserOut(u))
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -473,6 +697,18 @@ func sessionIDFromPath(r *http.Request) (uint, error) {
 func gameIDFromPath(r *http.Request) (uint, error) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 2 || parts[0] != "games" {
+		return 0, strconv.ErrSyntax
+	}
+	n, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return uint(n), nil
+}
+
+func userIDFromPath(r *http.Request) (uint, error) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 2 || parts[0] != "users" {
 		return 0, strconv.ErrSyntax
 	}
 	n, err := strconv.ParseUint(parts[1], 10, 64)

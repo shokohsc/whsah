@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -74,6 +75,23 @@ func main() {
 	}
 	if v := os.Getenv("VDI_AGENT_TOKEN"); v != "" {
 		cfg.AgentToken = v
+	}
+	if v := os.Getenv("VDI_FRONTEND_ORIGIN"); v != "" {
+		cfg.FrontendOrigin = v
+	}
+	if v := os.Getenv("VDI_ADMIN_SUBJECTS"); v != "" {
+		cfg.AdminSubjects = strings.Split(v, ",")
+	}
+	if v := os.Getenv("VDI_DEFAULT_AGE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.DefaultAge = n
+		}
+	}
+	if v := os.Getenv("VDI_OIDC_PUBLIC_URL"); v != "" {
+		cfg.OIDCPublicURL = v
+	}
+	if v := os.Getenv("VDI_OIDC_CLIENT_SECRET"); v != "" {
+		cfg.OIDCClientSecret = v
 	}
 
 	gormDB, err := db.Open(cfg)

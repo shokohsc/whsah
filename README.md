@@ -17,7 +17,7 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 
 ## Architecture boundaries
 
-- `internal/server` — OIDC JWT verification (JWKS), RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
+- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), JWT verification (JWKS), first-login user provisioning and admin-subject promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
 - `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
 - `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
 - `internal/backup` — periodic backup tick + VM deletion after `last_user_session + delay`
@@ -36,6 +36,11 @@ Server optional env vars with defaults:
 - `VDI_BACKUP_INTERVAL` — default `7*24h` (once per week)
 - `VDI_VM_DELETION_DELAY` — default `30*24h` after `last_user_session` (1 month)
 - `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token)
+- `VDI_OIDC_PUBLIC_URL` — public API base URL used to build the OIDC redirect URI (default `https://api.domain.tld`; must match `VDI_OIDC_PUBLIC_URL`/auth/callback registered at the provider)
+- `VDI_OIDC_CLIENT_SECRET` — OIDC confidential client secret (optional)
+- `VDI_FRONTEND_ORIGIN` — frontend origin allowed by CORS and used as the login redirect target (default `https://domain.tld`)
+- `VDI_ADMIN_SUBJECTS` — comma-separated OIDC subjects/usernames provisioned (or promoted) to `admin` on login
+- `VDI_DEFAULT_AGE` — age assigned to first-time users (default `18`)
 - `VDI_LISTEN_ADDR` — default `:8080`
 - `VDI_IDLE_SECS` — agent idle shutdown in seconds (default `1800`)
 - `VDI_PROXMOX_BASE`, `VDI_PROXMOX_NODE` — Proxmox API base URL + node name
@@ -77,7 +82,7 @@ Tests: `go test ./...`
 
 ## Kubernetes deployment
 
-See `deploy/k8s/` for example YAML manifests: server Deployment + Service + ServiceAccount with RBAC for in-cluster K8s access, an example agent Deployment, and a worker Deployment that consumes the PostgreSQL game job queue. The server autodetects in-cluster auth via `KUBERNETES_SERVICE_HOST` when `VDI_KUBERNETES_MODE=auto`; set `VDI_KUBERNETES_MODE=incluster` to force service-account auth or `outofcluster` with `VDI_KUBECONFIG` to use a kubeconfig.
+See `deploy/k8s/` for example YAML manifests: server Deployment + Service + ServiceAccount with RBAC for in-cluster K8s access, a Gateway API ListenerSet + HTTPRoute exposing the API at `api.domain.tld`, an example agent Deployment, and a worker Deployment that consumes the PostgreSQL game job queue. The server autodetects in-cluster auth via `KUBERNETES_SERVICE_HOST` when `VDI_KUBERNETES_MODE=auto`; set `VDI_KUBERNETES_MODE=incluster` to force service-account auth or `outofcluster` with `VDI_KUBECONFIG` to use a kubeconfig.
 
 Apply the server stack:
 
@@ -112,7 +117,11 @@ All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migr
 
 ## API endpoints
 
+The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yaml`), not at a `domain.tld/api` path prefix. The frontend calls it via the API base URL baked in at build time (`VITE_API_BASE`).
+
+- `GET /auth/login` — redirects to the OIDC provider (dev mode: straight back to the frontend `/login` route with a token); `GET /auth/callback` completes the flow and returns the ID token to the frontend
 - `GET/POST /games` — `PUT /games/{id}` (admin) updates `library_path`
+- `PUT /users/{id}` (admin) — change a user's `role` (`anonymous` / `gamer` / `admin`)
 - `POST /games/{id}/jobs` (admin) — enqueue a game job (`kind`: `config` or `metadata`, optional `payload`); returns `202` with the queued job
 - `GET /games/{id}/jobs` (admin) — list a game's jobs
 - `GET /jobs/{id}` — poll a job's `status`, `result`, `error`
@@ -137,6 +146,8 @@ Games are configured and enriched asynchronously through a PostgreSQL-backed que
 ## Security model
 
 - OIDC/JWKS verification; empty `VDI_OIDC_ISSUER` = dev-only mode that accepts any bearer token. Do not ship with it empty.
+- First login provisions the user as `gamer` (age `VDI_DEFAULT_AGE`); OIDC subjects in `VDI_ADMIN_SUBJECTS` are provisioned — or promoted — to `admin`
+- CORS allows only `VDI_FRONTEND_ORIGIN`
 - RBAC middleware (anonymous/gamer/admin)
 - Agent token auth (`Bearer VDI_AGENT_TOKEN`) on `/agent/vm/*` endpoints — agents never talk to Proxmox directly
 - PEGI age gating

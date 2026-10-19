@@ -12,7 +12,7 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": {
+      "^/(auth|games|sessions|jobs|users|me|config|health|agent)": {
         target: "http://localhost:8080",
         changeOrigin: true,
       },

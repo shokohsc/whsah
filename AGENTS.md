@@ -10,7 +10,7 @@
 - `go build ./...` — build everything
 - `go vet ./...` — vet
 - `go test ./...` — run tests
-- `cd web && npm install` then `npm run build` — frontend (Vite + Vue 3 + Bulma). Dev server proxies `/api` to `http://localhost:8080`.
+- `cd web && npm install` then `npm run build` — frontend (Vite + Vue 3 + Bulma). The API base is `VITE_API_BASE` (empty in dev, where the dev server proxies the API paths to `http://localhost:8080`; `https://api.domain.tld` in production).
 
 Go module: `selfhosted-gaming-vdi`, go 1.26.0.
 
@@ -22,6 +22,11 @@ Optional with defaults:
 - `VDI_BACKUP_INTERVAL` — default `7*24h` (once per week)
 - `VDI_VM_DELETION_DELAY` — default `30*24h` after `last_user_session` (1 month)
 - `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token)
+- `VDI_OIDC_PUBLIC_URL` — public API base used for the OIDC redirect URI (default `https://api.domain.tld`)
+- `VDI_OIDC_CLIENT_SECRET` — OIDC confidential client secret (optional)
+- `VDI_FRONTEND_ORIGIN` — CORS-allowed frontend origin / login redirect target (default `https://domain.tld`)
+- `VDI_ADMIN_SUBJECTS` — comma-separated OIDC subjects promoted to `admin` on login
+- `VDI_DEFAULT_AGE` — age for first-time users (default `18`)
 - `VDI_LISTEN_ADDR` — default `:8080`
 - `VDI_IDLE_SECS` — agent idle shutdown seconds (default 1800)
 - `VDI_PROXMOX_BASE`, `VDI_PROXMOX_NODE` — Proxmox API base URL + node name
@@ -51,7 +56,8 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 - All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migrate` (GORM AutoMigrate)
 
 ## Architecture boundaries
-- `internal/server` — OIDC JWT verification (JWKS), RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
+- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), JWT verification (JWKS), first-login provisioning + admin promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
+- `deploy/k8s/gateway.yaml` — Gateway API ListenerSet + HTTPRoute exposing the API at `api.domain.tld`; the frontend routes between the app and `/login` via a hash router (`web/src/main.js`)
 - `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
 - `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
 - `internal/backup` — periodic backup tick + VM deletion after `last_user_session + delay`

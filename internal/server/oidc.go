@@ -23,6 +23,13 @@ type OIDC struct {
 	ClientID string
 }
 
+// Identity is the authenticated user derived from an OIDC ID token.
+type Identity struct {
+	Subject  string
+	Email    string
+	Username string
+}
+
 // Verifier validates OIDC ID tokens against the provider's JWKS endpoint.
 type Verifier struct {
 	issuer   string
@@ -42,17 +49,17 @@ func NewVerifier(oidc OIDC) *Verifier {
 	}
 }
 
-// Verify parses and validates an ID token, returning the subject. An empty
-// issuer disables OIDC and accepts any non-empty bearer token (dev only).
-func (v *Verifier) Verify(ctx context.Context, token string) (string, error) {
+// Verify parses and validates an ID token, returning the identity claims. An
+// empty issuer disables OIDC and accepts any non-empty bearer token (dev only).
+func (v *Verifier) Verify(ctx context.Context, token string) (Identity, error) {
 	if v.issuer == "" {
 		if token == "" {
-			return "", ErrUnauthenticated
+			return Identity{}, ErrUnauthenticated
 		}
-		return "dev-user", nil
+		return Identity{Subject: "dev-user", Email: "dev-user@dev.local", Username: "dev-user"}, nil
 	}
 	if err := v.ensureKeys(ctx); err != nil {
-		return "", err
+		return Identity{}, err
 	}
 	tok, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
@@ -68,26 +75,29 @@ func (v *Verifier) Verify(ctx context.Context, token string) (string, error) {
 		return key, nil
 	})
 	if err != nil {
-		return "", err
+		return Identity{}, err
 	}
 	claims, ok := tok.Claims.(jwt.MapClaims)
 	if !ok || !tok.Valid {
-		return "", ErrUnauthenticated
+		return Identity{}, ErrUnauthenticated
 	}
 	iss, _ := claims["iss"].(string)
 	if iss != v.issuer {
-		return "", fmt.Errorf("issuer mismatch: %q != %q", iss, v.issuer)
+		return Identity{}, fmt.Errorf("issuer mismatch: %q != %q", iss, v.issuer)
 	}
 	if v.clientID != "" {
 		if aud, _ := claims["aud"].(string); aud != v.clientID {
-			return "", fmt.Errorf("audience mismatch")
+			return Identity{}, fmt.Errorf("audience mismatch")
 		}
 	}
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
-		return "", ErrUnauthenticated
+		return Identity{}, ErrUnauthenticated
 	}
-	return sub, nil
+	id := Identity{Subject: sub}
+	id.Email, _ = claims["email"].(string)
+	id.Username, _ = claims["preferred_username"].(string)
+	return id, nil
 }
 
 func (v *Verifier) ensureKeys(ctx context.Context) error {
@@ -177,22 +187,6 @@ func (v *Verifier) OAuth2() *oauth2.Config {
 	}
 }
 
-// AuthMiddleware requires a valid OIDC identity and stores the subject in the
-// request context under ctxUserKey.
-func AuthMiddleware(v *Verifier) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			token := bearerToken(r)
-			sub, err := v.Verify(r.Context(), token)
-			if err != nil {
-				http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
-				return
-			}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxUserKey, sub)))
-		})
-	}
-}
-
 func bearerToken(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	if !strings.HasPrefix(h, "Bearer ") {
@@ -205,9 +199,9 @@ type ctxKey int
 
 const ctxUserKey ctxKey = iota
 
-func userID(r *http.Request) string {
-	if v, ok := r.Context().Value(ctxUserKey).(string); ok {
+func userID(r *http.Request) Identity {
+	if v, ok := r.Context().Value(ctxUserKey).(Identity); ok {
 		return v
 	}
-	return ""
+	return Identity{}
 }

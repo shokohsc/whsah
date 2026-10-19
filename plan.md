@@ -22,6 +22,7 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 
 ## Frontend
 - Two themes, light and dark; defaults to the system theme.
+- Login is a `/login` route (hash router); the API lives at the `api.domain.tld` subdomain.
 - Unauthenticated users see games at the lowest PEGI rating, sorted by most recent release date.
 - Logged-in users see games whose PEGI rating is within their age.
 - Users search for games within their age.
