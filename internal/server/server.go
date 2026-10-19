@@ -12,6 +12,7 @@ import (
 
 	"selfhosted-gaming-vdi/config"
 	"selfhosted-gaming-vdi/internal/proxmox"
+	"selfhosted-gaming-vdi/internal/worker"
 	"selfhosted-gaming-vdi/models"
 )
 
@@ -33,6 +34,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /games", s.handleListGames)
 	mux.Handle("POST /games", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateGame)))
 	mux.Handle("PUT /games/{id}", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleUpdateGame)))
+	mux.Handle("POST /games/{id}/jobs", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleEnqueueGameJob)))
+	mux.Handle("GET /games/{id}/jobs", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListGameJobs)))
+	mux.Handle("GET /jobs/{id}", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleGetJob)))
 	mux.Handle("GET /sessions", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleListSessions)))
 	mux.Handle("POST /sessions", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleCreateSession)))
 	mux.Handle("DELETE /sessions/", AuthMiddleware(s.verifier)(http.HandlerFunc(s.handleDeleteSession)))
@@ -131,6 +135,65 @@ func (s *Server) handleUpdateGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, g)
+}
+
+func (s *Server) handleEnqueueGameJob(w http.ResponseWriter, r *http.Request) {
+	id, err := gameIDFromPath(r)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+	var g models.Game
+	if err := s.db.First(&g, id).Error; err != nil {
+		http.Error(w, `{"error":"game not found"}`, http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Kind    models.JobKind  `json:"kind"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
+	var payload any
+	if len(req.Payload) > 0 {
+		payload = json.RawMessage(req.Payload)
+	}
+	job, err := worker.Enqueue(s.db, g.ID, req.Kind, payload)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadRequest)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, job)
+}
+
+func (s *Server) handleListGameJobs(w http.ResponseWriter, r *http.Request) {
+	id, err := gameIDFromPath(r)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+	var jobs []models.GameJob
+	if err := s.db.Where("game_id = ?", id).Order("id").Find(&jobs).Error; err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, jobs)
+}
+
+func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	id, err := jobIDFromPath(r)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+	var job models.GameJob
+	if err := s.db.First(&job, id).Error; err != nil {
+		http.Error(w, `{"error":"job not found"}`, http.StatusNotFound)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, job)
 }
 
 func currentUser(s *Server, r *http.Request) (models.User, bool) {
@@ -410,6 +473,18 @@ func sessionIDFromPath(r *http.Request) (uint, error) {
 func gameIDFromPath(r *http.Request) (uint, error) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 2 || parts[0] != "games" {
+		return 0, strconv.ErrSyntax
+	}
+	n, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return uint(n), nil
+}
+
+func jobIDFromPath(r *http.Request) (uint, error) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 2 || parts[0] != "jobs" {
 		return 0, strconv.ErrSyntax
 	}
 	n, err := strconv.ParseUint(parts[1], 10, 64)

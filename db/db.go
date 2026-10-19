@@ -16,11 +16,12 @@ func Open(cfg config.Config) (*gorm.DB, error) {
 	})
 }
 
-// Migrate auto-migrates the main tables (users, games, sessions).
+// Migrate auto-migrates the main tables (users, games, sessions, game jobs).
 func Migrate(db *gorm.DB) error {
 	return db.AutoMigrate(
 		&models.User{},
 		&models.Game{},
 		&models.Session{},
+		&models.GameJob{},
 	)
 }

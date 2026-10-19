@@ -64,6 +64,10 @@ type Config struct {
 	// LibraryPath is the default game library mount path used by the agent.
 	LibraryPath string
 
+	// MetadataURL is the HTTP metadata source used by game metadata jobs
+	// (empty = metadata retrieval disabled).
+	MetadataURL string
+
 	// LokiURL is the remote Loki endpoint for agent logs (empty = disabled).
 	LokiURL string
 
