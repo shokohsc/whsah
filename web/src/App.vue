@@ -14,6 +14,26 @@
   <section class="section" :class="themeClass">
     <div class="container">
       <h1 class="title">Games</h1>
+
+      <!-- Roles & permissions: which actions each role is allowed -->
+      <div class="box" :class="themeClass">
+        <h2 class="subtitle">Role: {{ role }}</h2>
+        <table class="table is-narrow is-fullwidth" :class="themeClass">
+          <thead>
+            <tr>
+              <th>Role</th>
+              <th>Allowed actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in roles" :key="r.role" :class="{ 'has-text-weight-bold': r.role === role }">
+              <td>{{ r.role }}</td>
+              <td>{{ r.actions }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
       <div class="field">
         <label class="label">Search</label>
         <div class="control">
@@ -25,12 +45,12 @@
         <p class="control">
           <button class="button is-primary" @click="browse">Browse</button>
         </p>
-        <p class="control" v-if="user">
+        <p class="control" v-if="can.override">
           <button class="button is-link" @click="showOverride = !showOverride">VM config</button>
         </p>
       </div>
 
-      <div v-if="showOverride && user" class="box mt-4" :class="themeClass">
+      <div v-if="showOverride && can.override" class="box mt-4" :class="themeClass">
         <h2 class="subtitle">VM config override</h2>
         <div class="field">
           <label class="label">CPU cores</label>
@@ -56,7 +76,7 @@
       </div>
 
       <!-- Admin: game library path management -->
-      <div v-if="isAdmin" class="box mt-4" :class="themeClass">
+      <div v-if="can.manageGames" class="box mt-4" :class="themeClass">
         <h2 class="subtitle">Game library paths (admin)</h2>
         <table class="table is-fullwidth is-striped" :class="themeClass">
           <thead>
@@ -106,7 +126,8 @@
             <td>{{ g.vm_config.ram_size }} MB</td>
             <td>{{ g.vm_config.disk_size }} GB</td>
             <td>
-              <button class="button is-small is-primary" @click="play(g)">Play</button>
+              <button v-if="can.play" class="button is-small is-primary" @click="play(g)">Play</button>
+              <span v-else class="tag is-light">Sign in as gamer to play</span>
             </td>
           </tr>
         </tbody>
@@ -128,10 +149,28 @@ const msg = ref("")
 const games = ref([])
 const allGames = ref([])
 const user = ref(null)
-const isAdmin = ref(false)
 const showOverride = ref(false)
 const override = ref({ cpu_cores: 2, ram_size: 4096, disk_size: 128 })
 const libraryEdits = ref({})
+
+const roles = [
+  { role: "anonymous", actions: "Browse games" },
+  { role: "gamer", actions: "Browse games · Play · VM config override" },
+  { role: "admin", actions: "Browse games · Play · VM config override · Manage games · Manage users" },
+]
+
+const role = computed(() => user.value?.role || "anonymous")
+const can = computed(() => {
+  const r = role.value
+  const gamer = r === "gamer" || r === "admin"
+  return {
+    browse: true,
+    play: gamer,
+    override: gamer,
+    manageGames: r === "admin",
+    manageUsers: r === "admin",
+  }
+})
 
 const themeClass = computed(() => {
   const t = theme.value
@@ -181,7 +220,6 @@ async function load() {
     })
     const me = await api("/me")
     user.value = me
-    isAdmin.value = me.role === "admin"
   } catch (e) {
     error.value = e.message
   }
