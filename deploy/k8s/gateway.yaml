@@ -1,0 +1,48 @@
+# Exposes the API at the api.domain.tld subdomain (not a domain.tld/api path
+# prefix) through the shared Gateway API gateway.
+#
+# Replace the parentRef name/namespace (the shared Gateway) and the TLS secret
+# with your cluster's values before applying.
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: vdi-listeners
+  labels:
+    app: vdi
+spec:
+  parentRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: shared-gateway
+    namespace: gateway
+  listeners:
+    - name: api
+      hostname: api.domain.tld
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - group: ""
+            kind: Secret
+            name: domain-tld-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: vdi-api
+  labels:
+    app: vdi
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: ListenerSet
+      name: vdi-listeners
+      sectionName: api
+  rules:
+    - backendRefs:
+        - name: vdi-server
+          port: 80

@@ -12,6 +12,18 @@ const DefaultVMDeletionDelay = 30 * 24 * time.Hour
 // DefaultIdleSecs is the default agent idle shutdown delay (30 minutes).
 const DefaultIdleSecs = 1800
 
+// DefaultFrontendOrigin is the browser origin allowed to call the API from
+// the main site (the API itself is served from the api.<domain> subdomain).
+const DefaultFrontendOrigin = "https://domain.tld"
+
+// DefaultPublicURL is the public base URL of the API server (the api.<domain>
+// subdomain), used to build the OIDC redirect URI.
+const DefaultPublicURL = "https://api.domain.tld"
+
+// DefaultAge is the age assigned to a user auto-provisioned on first login.
+// OIDC carries no standard age claim, so admins adjust it per user afterwards.
+const DefaultAge = 18
+
 // ProxmoxAuthMode selects how the server authenticates to Proxmox VE.
 type ProxmoxAuthMode string
 
@@ -78,6 +90,20 @@ type Config struct {
 
 	// AgentToken is the shared token agents use to authenticate to the server.
 	AgentToken string
+
+	// FrontendOrigin is the browser origin allowed by CORS to call the API
+	// (empty disables CORS).
+	FrontendOrigin string
+	// OIDCPublicURL is the public base URL of this server, used to build the
+	// OIDC redirect URI (<OIDCPublicURL>/auth/callback).
+	OIDCPublicURL string
+	// OIDCClientSecret is the confidential client secret used to exchange the
+	// authorization code for tokens (empty for public clients).
+	OIDCClientSecret string
+	// AdminSubjects are OIDC subjects auto-provisioned (or promoted) to admin.
+	AdminSubjects []string
+	// DefaultAge is the age assigned to users auto-provisioned on first login.
+	DefaultAge int
 }
 
 // Default returns a Config populated with the plan.md defaults.
@@ -89,5 +115,8 @@ func Default() Config {
 		IdleSecs:         DefaultIdleSecs,
 		ProxmoxAuthMode:  ProxmoxAuthToken,
 		KubernetesMode:   KubernetesModeAuto,
+		FrontendOrigin:   DefaultFrontendOrigin,
+		OIDCPublicURL:    DefaultPublicURL,
+		DefaultAge:       DefaultAge,
 	}
 }

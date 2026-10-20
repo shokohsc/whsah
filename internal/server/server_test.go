@@ -64,7 +64,7 @@ func seedGames(t *testing.T, db *gorm.DB) {
 }
 
 func withUserContext(r *http.Request, sub string) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), ctxUserKey, sub))
+	return r.WithContext(context.WithValue(r.Context(), ctxUserKey, Identity{Subject: sub}))
 }
 
 func reqBody(v any) *strings.Reader {
@@ -535,6 +535,79 @@ func TestGetJob(t *testing.T) {
 	}
 }
 
+func TestEnsureUserProvisionsOnFirstLogin(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{DefaultAge: 18})
+
+	u, err := srv.ensureUser(Identity{Subject: "sub-1", Email: "one@example.local", Username: "one"})
+	if err != nil {
+		t.Fatalf("ensureUser: %v", err)
+	}
+	if u.Role != models.RoleGamer || u.Age != 18 || u.Username != "one" {
+		t.Fatalf("unexpected provisioned user: %+v", u)
+	}
+
+	// second login returns the same row, not a duplicate
+	again, err := srv.ensureUser(Identity{Subject: "sub-1", Email: "one@example.local"})
+	if err != nil || again.ID != u.ID {
+		t.Fatalf("expected same user, got %+v err=%v", again, err)
+	}
+	var count int64
+	db.Model(&models.User{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("expected 1 user, got %d", count)
+	}
+}
+
+func TestEnsureUserAdminSubjectAndPromotion(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{DefaultAge: 18, AdminSubjects: []string{"boss"}})
+
+	u, err := srv.ensureUser(Identity{Subject: "boss", Email: "boss@example.local"})
+	if err != nil {
+		t.Fatalf("ensureUser: %v", err)
+	}
+	if u.Role != models.RoleAdmin {
+		t.Fatalf("expected admin, got %s", u.Role)
+	}
+
+	// an existing non-admin listed as admin subject is promoted
+	db.Create(&models.User{Username: "promo", Email: "promo@example.local", Age: 20, Role: models.RoleGamer})
+	srv.cfg.AdminSubjects = []string{"promo"}
+	u, err = srv.ensureUser(Identity{Subject: "promo", Email: "promo@example.local"})
+	if err != nil {
+		t.Fatalf("ensureUser: %v", err)
+	}
+	if u.Role != models.RoleAdmin {
+		t.Fatalf("expected promotion to admin, got %s", u.Role)
+	}
+}
+
+func TestCORSAllowsFrontendOrigin(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{FrontendOrigin: "https://domain.tld"})
+
+	r := httptest.NewRequest(http.MethodOptions, "/games", nil)
+	r.Header.Set("Origin", "https://domain.tld")
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://domain.tld" {
+		t.Fatalf("allow-origin = %q", got)
+	}
+
+	// a different origin gets no CORS headers
+	r = httptest.NewRequest(http.MethodGet, "/games", nil)
+	r.Header.Set("Origin", "https://evil.example")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("unexpected CORS header for foreign origin")
+	}
+}
+
 func TestJobRoutesAuth(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
@@ -566,5 +639,78 @@ func TestJobRoutesAuth(t *testing.T) {
 	srv.Routes().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("token job status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateUserRole(t *testing.T) {
+	db := testDB(t)
+	seedUsers(t, db)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	// invalid role -> 400
+	r := httptest.NewRequest(http.MethodPut, "/users/2", reqBody(map[string]any{"role": "bogus"}))
+	w := httptest.NewRecorder()
+	srv.handleUpdateUserRole(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid role status = %d, want 400", w.Code)
+	}
+
+	// missing user -> 404
+	r = httptest.NewRequest(http.MethodPut, "/users/999", reqBody(map[string]any{"role": "admin"}))
+	w = httptest.NewRecorder()
+	srv.handleUpdateUserRole(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("missing user status = %d, want 404", w.Code)
+	}
+
+	// promote child (id 2) to admin
+	r = httptest.NewRequest(http.MethodPut, "/users/2", reqBody(map[string]any{"role": "admin"}))
+	w = httptest.NewRecorder()
+	srv.handleUpdateUserRole(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update role status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var u models.User
+	db.First(&u, 2)
+	if u.Role != models.RoleAdmin {
+		t.Fatalf("role = %s, want admin", u.Role)
+	}
+
+	// gamer cannot update roles (dev mode resolves any token to a gamer)
+	r = httptest.NewRequest(http.MethodPut, "/users/1", reqBody(map[string]any{"role": "admin"}))
+	r.Header.Set("Authorization", "Bearer any")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("gamer update role status = %d, want 403", w.Code)
+	}
+}
+
+func TestAuthLoginDevModeRedirectsWithToken(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+	r := httptest.NewRequest(http.MethodGet, "/auth/login", nil)
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusFound {
+		t.Fatalf("auth login status = %d, want 302", w.Code)
+	}
+	want := config.DefaultFrontendOrigin + "/#/login?token=dev-token"
+	if got := w.Header().Get("Location"); got != want {
+		t.Fatalf("redirect = %q, want %q", got, want)
+	}
+}
+
+func TestAuthCallbackRejectsBadState(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+	r := httptest.NewRequest(http.MethodGet, "/auth/callback?code=x&state=y", nil)
+	w := httptest.NewRecorder()
+	srv.handleAuthCallback(w, r)
+	if w.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302", w.Code)
+	}
+	if got := w.Header().Get("Location"); !strings.Contains(got, "error=invalid+oauth+state") {
+		t.Fatalf("callback redirect = %q, want invalid state error", got)
 	}
 }
