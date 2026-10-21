@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
+
+	"selfhosted-gaming-vdi/internal/logging"
 )
 
 // AuthMode selects how the client authenticates to Proxmox VE.
@@ -38,6 +41,7 @@ type Client struct {
 	http   *http.Client
 	base   string
 	node   string
+	logger *slog.Logger
 
 	// Token auth
 	token string
@@ -52,21 +56,29 @@ type Client struct {
 // New creates a Client using API token authentication.
 func New(base, node, token string) *Client {
 	return &Client{
-		http:  &http.Client{Timeout: 30 * time.Second},
-		base:  base,
-		node:  node,
-		token: token,
+		http:   &http.Client{Timeout: 30 * time.Second},
+		base:   base,
+		node:   node,
+		token:  token,
+		logger: slog.Default(),
 	}
 }
 
 // NewPassword creates a Client using username/password authentication.
 func NewPassword(base, node, user, password string) *Client {
 	return &Client{
-		http:  &http.Client{Timeout: 30 * time.Second},
-		base:  base,
-		node:  node,
-		creds: Credentials{Mode: AuthPassword, User: user, Password: password},
+		http:   &http.Client{Timeout: 30 * time.Second},
+		base:   base,
+		node:   node,
+		creds:  Credentials{Mode: AuthPassword, User: user, Password: password},
+		logger: slog.Default(),
 	}
+}
+
+// WithLogger sets the logger used by the client.
+func (c *Client) WithLogger(l *slog.Logger) *Client {
+	c.logger = l
+	return c
 }
 
 func (c *Client) isTokenAuth() bool {
@@ -111,6 +123,7 @@ func (c *Client) ensureTicket() error {
 	}
 	c.ticket = res.Data.Ticket
 	c.csrfToken = res.Data.CSRFPreventionToken
+	c.logger.Debug("proxmox ticket fetched")
 	return nil
 }
 
@@ -150,13 +163,16 @@ func (c *Client) req(method, path string, body any) ([]byte, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	c.logger.Debug("proxmox request", "method", method, "path", path)
 	resp, err := c.http.Do(req)
 	if err != nil {
+		c.logger.Error("proxmox request failed", "method", method, "path", path, "err", logging.SafeError(err))
 		return nil, err
 	}
 	defer resp.Body.Close()
 	out, err := io.ReadAll(resp.Body)
 	if err != nil {
+		c.logger.Error("proxmox response unreadable", "method", method, "path", path, "err", err)
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -165,10 +181,13 @@ func (c *Client) req(method, path string, body any) ([]byte, error) {
 			c.ticket = ""
 			c.csrfToken = ""
 			c.ticketMu.Unlock()
+			c.logger.Warn("proxmox ticket expired, retrying", "method", method, "path", path)
 			return c.retryReq(method, path, body)
 		}
+		c.logger.Warn("proxmox request rejected", "method", method, "path", path, "status", resp.StatusCode)
 		return nil, fmt.Errorf("proxmox %s %s: %d %s", method, path, resp.StatusCode, string(out))
 	}
+	c.logger.Debug("proxmox response", "method", method, "path", path, "status", resp.StatusCode)
 	return out, nil
 }
 
@@ -193,8 +212,10 @@ func (c *Client) retryReq(method, path string, body any) ([]byte, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	c.logger.Debug("proxmox request (retry)", "method", method, "path", path)
 	resp, err := c.http.Do(req)
 	if err != nil {
+		c.logger.Error("proxmox retry failed", "method", method, "path", path, "err", logging.SafeError(err))
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -203,6 +224,7 @@ func (c *Client) retryReq(method, path string, body any) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.logger.Warn("proxmox retry rejected", "method", method, "path", path, "status", resp.StatusCode)
 		return nil, fmt.Errorf("proxmox %s %s: %d %s", method, path, resp.StatusCode, string(out))
 	}
 	return out, nil
@@ -279,7 +301,9 @@ func (c *Client) Clone(template int, name string, cores, memoryMiB, diskGiB int)
 	vmid := res.Data.Vmid
 	// Apply disk size via config update.
 	if diskGiB > 0 {
-		c.req(http.MethodPut, fmt.Sprintf("/api2/json/nodes/%s/qemu/%d/config", c.node, vmid), map[string]any{"scsi0": sizeSpec(diskGiB)})
+		if _, err := c.req(http.MethodPut, fmt.Sprintf("/api2/json/nodes/%s/qemu/%d/config", c.node, vmid), map[string]any{"scsi0": sizeSpec(diskGiB)}); err != nil {
+			c.logger.Warn("proxmox disk resize failed", "vmid", vmid, "disk_gib", diskGiB, "err", err)
+		}
 	}
 	return vmid, nil
 }

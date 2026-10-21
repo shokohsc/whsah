@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -712,5 +714,27 @@ func TestAuthCallbackRejectsBadState(t *testing.T) {
 	}
 	if got := w.Header().Get("Location"); !strings.Contains(got, "error=invalid+oauth+state") {
 		t.Fatalf("callback redirect = %q, want invalid state error", got)
+	}
+}
+
+func TestAccessLogRecordsRequest(t *testing.T) {
+	db := testDB(t)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default()).WithLogger(logger)
+
+	r := httptest.NewRequest(http.MethodGet, "/health?token=secret", nil)
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+
+	line := buf.String()
+	if !strings.Contains(line, `"msg":"http request"`) {
+		t.Fatalf("access log missing: %s", line)
+	}
+	if !strings.Contains(line, `"path":"/health"`) {
+		t.Fatalf("access log missing path: %s", line)
+	}
+	if strings.Contains(line, "secret") {
+		t.Fatalf("access log leaked query string: %s", line)
 	}
 }

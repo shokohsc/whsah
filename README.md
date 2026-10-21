@@ -14,6 +14,7 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 - Ludusavi gamesave copy
 - SMB game library mount
 - Loki remote logging for agent logs
+- Structured JSON logs (`log/slog`) on stdout, level set by `VDI_LOG_LEVEL`
 
 ## Architecture boundaries
 
@@ -52,6 +53,7 @@ Server optional env vars with defaults:
 - `VDI_KUBERNETES_MODE` — `auto` (default), `incluster`, or `outofcluster`
 - `VDI_KUBECONFIG` — kubeconfig path (out-of-cluster mode)
 - `VDI_AGENT_TOKEN` — shared bearer token agents use to authenticate to the server
+- `VDI_LOG_LEVEL` — log level for all binaries: `debug`, `info` (default), `warn`, `error`. Logs are JSON on stdout.
 
 Agent env vars:
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,20 +18,28 @@ import (
 	"gorm.io/gorm"
 
 	"selfhosted-gaming-vdi/config"
+	"selfhosted-gaming-vdi/internal/logging"
 	"selfhosted-gaming-vdi/internal/proxmox"
 	"selfhosted-gaming-vdi/internal/worker"
 	"selfhosted-gaming-vdi/models"
 )
 
 type Server struct {
-	db      *gorm.DB
+	db       *gorm.DB
 	verifier *Verifier
-	px      *proxmox.Client
-	cfg     config.Config
+	px       *proxmox.Client
+	cfg      config.Config
+	logger   *slog.Logger
 }
 
 func New(db *gorm.DB, verifier *Verifier, px *proxmox.Client, cfg config.Config) *Server {
-	return &Server{db: db, verifier: verifier, px: px, cfg: cfg}
+	return &Server{db: db, verifier: verifier, px: px, cfg: cfg, logger: slog.Default()}
+}
+
+// WithLogger sets the logger used by the server.
+func (s *Server) WithLogger(l *slog.Logger) *Server {
+	s.logger = l
+	return s
 }
 
 func (s *Server) Routes() http.Handler {
@@ -58,7 +67,44 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /agent/vm/{vmid}/start", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMStart)))
 	mux.Handle("POST /agent/vm/{vmid}/stop", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMStop)))
 	mux.Handle("GET /agent/vm/{vmid}/config", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMConfig)))
-	return s.withCORS(mux)
+	return s.accessLog(s.withCORS(mux))
+}
+
+// statusRecorder captures the response status for access logging.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusRecorder) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// accessLog logs one line per request. The query string is deliberately left
+// out: it carries OAuth codes and tokens.
+func (s *Server) accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		level := slog.LevelInfo
+		switch {
+		case rec.status >= 500:
+			level = slog.LevelError
+		case rec.status >= 400:
+			level = slog.LevelWarn
+		case r.Method == http.MethodOptions || r.URL.Path == "/health":
+			level = slog.LevelDebug
+		}
+		s.logger.Log(r.Context(), level, "http request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+			"remote_addr", r.RemoteAddr,
+		)
+	})
 }
 
 // withCORS allows the main-site browser origin to call the API hosted on the
@@ -85,10 +131,12 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, err := s.verifier.Verify(r.Context(), bearerToken(r))
 		if err != nil {
+			s.logger.Warn("unauthenticated request", "path", r.URL.Path, "method", r.Method, "err", err)
 			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
 			return
 		}
 		if _, err := s.ensureUser(id); err != nil {
+			s.logger.Error("user provisioning failed", "subject", id.Subject, "err", err)
 			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 			return
 		}
@@ -111,6 +159,7 @@ func (s *Server) ensureUser(id Identity) (models.User, error) {
 			if err := s.db.Save(&u).Error; err != nil {
 				return u, err
 			}
+			s.logger.Info("user promoted to admin", "user_id", u.ID, "username", u.Username)
 		}
 		return u, nil
 	}
@@ -137,6 +186,7 @@ func (s *Server) ensureUser(id Identity) (models.User, error) {
 		}
 		return u, err
 	}
+	s.logger.Info("user provisioned", "user_id", u.ID, "username", u.Username, "role", u.Role)
 	return u, nil
 }
 
@@ -194,11 +244,13 @@ func (s *Server) frontendLogin(errMsg, token string) string {
 // issuer configured) it hands the frontend a dummy token directly.
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if s.verifier.issuer == "" {
+		s.logger.Warn("oidc login started in dev mode (no issuer configured)")
 		http.Redirect(w, r, s.frontendLogin("", "dev-token"), http.StatusFound)
 		return
 	}
 	state, err := randomState()
 	if err != nil {
+		s.logger.Error("oidc state generation failed", "err", err)
 		http.Error(w, `{"error":"state error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -221,24 +273,29 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	cookie, err := r.Cookie("vdi_oauth_state")
 	if err != nil || cookie.Value == "" || cookie.Value != state {
+		s.logger.Warn("oidc callback rejected: invalid state")
 		http.Redirect(w, r, s.frontendLogin("invalid oauth state", ""), http.StatusFound)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "vdi_oauth_state", Value: "", Path: "/auth", MaxAge: -1})
 	if e := r.URL.Query().Get("error"); e != "" {
+		s.logger.Warn("oidc provider returned an error", "provider_error", e)
 		http.Redirect(w, r, s.frontendLogin(e, ""), http.StatusFound)
 		return
 	}
 	token, err := s.oauth2Config().Exchange(r.Context(), r.URL.Query().Get("code"))
 	if err != nil {
+		s.logger.Error("oidc token exchange failed", "err", err)
 		http.Redirect(w, r, s.frontendLogin("token exchange failed", ""), http.StatusFound)
 		return
 	}
 	idToken, _ := token.Extra("id_token").(string)
 	if idToken == "" {
+		s.logger.Error("oidc response carried no id_token")
 		http.Redirect(w, r, s.frontendLogin("no id_token in response", ""), http.StatusFound)
 		return
 	}
+	s.logger.Info("oidc login completed")
 	http.Redirect(w, r, s.frontendLogin("", idToken), http.StatusFound)
 }
 
@@ -282,9 +339,11 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.db.Create(&g).Error; err != nil {
+		s.logger.Error("game create failed", "title", g.Title, "err", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
+	s.logger.Info("game created", "game_id", g.ID, "title", g.Title, "pegi_rating", g.PEGIRating)
 	s.writeJSON(w, http.StatusCreated, g)
 }
 
@@ -312,9 +371,11 @@ func (s *Server) handleUpdateGame(w http.ResponseWriter, r *http.Request) {
 	}
 	g.LibraryPath = req.LibraryPath
 	if err := s.db.Save(&g).Error; err != nil {
+		s.logger.Error("game update failed", "game_id", g.ID, "err", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
+	s.logger.Info("game updated", "game_id", g.ID, "library_path", g.LibraryPath)
 	s.writeJSON(w, http.StatusOK, g)
 }
 
@@ -343,9 +404,11 @@ func (s *Server) handleEnqueueGameJob(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := worker.Enqueue(s.db, g.ID, req.Kind, payload)
 	if err != nil {
+		s.logger.Error("game job enqueue failed", "game_id", g.ID, "kind", req.Kind, "err", err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadRequest)
 		return
 	}
+	s.logger.Info("game job enqueued", "job_id", job.ID, "game_id", g.ID, "kind", req.Kind)
 	s.writeJSON(w, http.StatusAccepted, job)
 }
 
@@ -446,9 +509,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		OverrideDiskSize:  req.OverrideDiskSize,
 	}
 	if err := s.db.Create(&sess).Error; err != nil {
+		s.logger.Error("session create failed", "user_id", u.ID, "game_id", g.ID, "err", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
+	s.logger.Info("session created", "session_id", sess.ID, "user_id", u.ID, "game_id", g.ID, "vm_id", sess.VMID)
 	s.writeJSON(w, http.StatusCreated, sess)
 }
 
@@ -469,6 +534,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 	result := q.Delete(&models.Session{})
 	if result.Error != nil {
+		s.logger.Error("session delete failed", "session_id", id, "err", result.Error)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -476,6 +542,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 		return
 	}
+	s.logger.Info("session deleted", "session_id", id, "user_id", u.ID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -520,9 +587,11 @@ func (s *Server) handleOverrideVMConfig(w http.ResponseWriter, r *http.Request) 
 	}
 	if len(updates) > 0 {
 		if err := s.db.Model(&sess).Updates(updates).Error; err != nil {
+			s.logger.Error("session vm config override failed", "session_id", sess.ID, "err", err)
 			http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 			return
 		}
+		s.logger.Info("session vm config overridden", "session_id", sess.ID, "fields", len(updates))
 	}
 	s.writeJSON(w, http.StatusOK, sess)
 }
@@ -580,9 +649,11 @@ func (s *Server) handleUpdateUserRole(w http.ResponseWriter, r *http.Request) {
 	}
 	u.Role = req.Role
 	if err := s.db.Save(&u).Error; err != nil {
+		s.logger.Error("user role update failed", "user_id", u.ID, "err", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
+	s.logger.Info("user role updated", "user_id", u.ID, "username", u.Username, "role", u.Role)
 	s.writeJSON(w, http.StatusOK, newUserOut(u))
 }
 
@@ -609,6 +680,7 @@ func (s *Server) requireRole(roles ...models.Role) func(http.Handler) http.Handl
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			u, ok := currentUser(s, r)
 			if !ok || !allowed[u.Role] {
+				s.logger.Warn("forbidden request", "path", r.URL.Path, "method", r.Method, "role", u.Role)
 				http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 				return
 			}
@@ -623,6 +695,7 @@ func (s *Server) requireAgentToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
 		if token == "" || token != s.cfg.AgentToken {
+			s.logger.Warn("agent auth failed", "path", r.URL.Path, "method", r.Method)
 			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
 			return
 		}
@@ -641,9 +714,11 @@ func (s *Server) handleAgentVMStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.px.Start(vmid); err != nil {
+		s.logger.Error("vm start failed", "vm_id", vmid, "err", logging.SafeError(err))
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
 		return
 	}
+	s.logger.Info("vm started", "vm_id", vmid)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -658,9 +733,11 @@ func (s *Server) handleAgentVMStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.px.Stop(vmid); err != nil {
+		s.logger.Error("vm stop failed", "vm_id", vmid, "err", logging.SafeError(err))
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
 		return
 	}
+	s.logger.Info("vm stopped", "vm_id", vmid)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -676,9 +753,11 @@ func (s *Server) handleAgentVMConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg, err := s.px.GetConfig(vmid)
 	if err != nil {
+		s.logger.Error("vm config fetch failed", "vm_id", vmid, "err", logging.SafeError(err))
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
 		return
 	}
+	s.logger.Debug("vm config fetched", "vm_id", vmid)
 	s.writeJSON(w, http.StatusOK, cfg)
 }
 

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +14,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"selfhosted-gaming-vdi/internal/logging"
 	"selfhosted-gaming-vdi/models"
 )
 
@@ -66,6 +67,7 @@ type Service struct {
 	db       *gorm.DB
 	fetcher  MetadataFetcher
 	interval time.Duration
+	logger   *slog.Logger
 }
 
 func New(db *gorm.DB, fetcher MetadataFetcher, interval time.Duration) *Service {
@@ -75,7 +77,13 @@ func New(db *gorm.DB, fetcher MetadataFetcher, interval time.Duration) *Service 
 	if fetcher == nil {
 		fetcher = &HTTPFetcher{}
 	}
-	return &Service{db: db, fetcher: fetcher, interval: interval}
+	return &Service{db: db, fetcher: fetcher, interval: interval, logger: slog.Default()}
+}
+
+// WithLogger sets the logger used by the service.
+func (s *Service) WithLogger(l *slog.Logger) *Service {
+	s.logger = l
+	return s
 }
 
 // Enqueue queues a job for a game. payload is marshalled to JSON (optional).
@@ -107,13 +115,15 @@ func Enqueue(db *gorm.DB, gameID uint, kind models.JobKind, payload any) (*model
 func (s *Service) Run(ctx context.Context) {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
+	s.logger.Info("worker started", "poll_interval", s.interval.String())
 	for {
 		select {
 		case <-ctx.Done():
+			s.logger.Info("worker stopped")
 			return
 		case <-ticker.C:
 			if err := s.tick(ctx); err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				log.Printf("worker tick: %v", err)
+				s.logger.Error("worker tick failed", "err", err)
 			}
 		}
 	}
@@ -149,6 +159,7 @@ func (s *Service) claim(ctx context.Context) (*models.GameJob, error) {
 		if res.RowsAffected == 1 {
 			job.Status = models.JobStatusProcessing
 			job.Attempts++
+			s.logger.Debug("job claimed", "job_id", job.ID, "game_id", job.GameID, "kind", job.Kind, "attempt", job.Attempts)
 			return &job, nil
 		}
 		// Lost the race to another worker; try the next pending job.
@@ -181,13 +192,14 @@ func (s *Service) finish(ctx context.Context, job *models.GameJob, result string
 	if err != nil {
 		updates["status"] = models.JobStatusFailed
 		updates["error"] = err.Error()
-		log.Printf("job %d (game %d, %s): %v", job.ID, job.GameID, job.Kind, err)
+		s.logger.Error("job failed", "job_id", job.ID, "game_id", job.GameID, "kind", job.Kind, "attempt", job.Attempts, "err", logging.SafeError(err))
 	} else {
 		updates["status"] = models.JobStatusDone
 		updates["error"] = ""
+		s.logger.Info("job done", "job_id", job.ID, "game_id", job.GameID, "kind", job.Kind, "attempt", job.Attempts)
 	}
 	if uerr := s.db.WithContext(ctx).Model(&models.GameJob{}).Where("id = ?", job.ID).Updates(updates).Error; uerr != nil {
-		log.Printf("job %d finalize: %v", job.ID, uerr)
+		s.logger.Error("job finalize failed", "job_id", job.ID, "err", uerr)
 	}
 }
 
@@ -213,6 +225,7 @@ func (s *Service) applyConfig(ctx context.Context, game *models.Game, job *model
 		return "", err
 	}
 	b, _ := json.Marshal(cfg)
+	s.logger.Debug("config applied", "game_id", game.ID, "cpu_cores", cfg.CPUCores, "ram_size", cfg.RAMSize, "disk_size", cfg.DiskSize)
 	return string(b), nil
 }
 
@@ -220,8 +233,10 @@ func (s *Service) applyConfig(ctx context.Context, game *models.Game, job *model
 func (s *Service) applyMetadata(ctx context.Context, game *models.Game) (string, error) {
 	meta, err := s.fetcher.FetchMetadata(ctx, game.Title)
 	if err != nil {
+		s.logger.Warn("metadata fetch failed", "game_id", game.ID, "err", logging.SafeError(err))
 		return "", err
 	}
+	s.logger.Debug("metadata fetched", "game_id", game.ID, "bytes", len(meta))
 	if err := s.db.WithContext(ctx).Model(&models.Game{}).Where("id = ?", game.ID).Update("metadata", meta).Error; err != nil {
 		return "", err
 	}

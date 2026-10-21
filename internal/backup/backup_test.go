@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -32,7 +33,7 @@ func testBackupService(t *testing.T) (*Service, *gorm.DB) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(countSrv.Close)
-	return &Service{db: db, px: proxmox.New(countSrv.URL, "node", "token"), interval: time.Hour, delay: time.Hour}, db
+	return &Service{db: db, px: proxmox.New(countSrv.URL, "node", "token"), interval: time.Hour, delay: time.Hour, logger: slog.Default()}, db
 }
 
 func TestBackupIncrementsCount(t *testing.T) {

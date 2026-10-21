@@ -38,6 +38,7 @@ Optional with defaults:
 - `VDI_KUBERNETES_MODE` — `auto` (default), `incluster`, or `outofcluster`
 - `VDI_KUBECONFIG` — kubeconfig path (out-of-cluster mode)
 - `VDI_AGENT_TOKEN` — shared bearer token agents use to authenticate to the server
+- `VDI_LOG_LEVEL` — log level for all binaries: `debug`, `info` (default), `warn`, `error` (logs are JSON on stdout)
 
 Worker env vars (`cmd/worker`):
 - `VDI_DATABASE_DSN` — PostgreSQL connection string (queue + game state; required)
