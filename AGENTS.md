@@ -21,11 +21,11 @@ Required for a real run:
 Optional with defaults:
 - `VDI_BACKUP_INTERVAL` — default `7*24h` (once per week)
 - `VDI_VM_DELETION_DELAY` — default `30*24h` after `last_user_session` (1 month)
-- `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token)
+- `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token). Endpoints (authorize, token, JWKS) come from the provider's discovery document, so Pocket ID, Keycloak, ... all work
 - `VDI_OIDC_PUBLIC_URL` — public API base used for the OIDC redirect URI (default `https://api.domain.tld`)
 - `VDI_OIDC_CLIENT_SECRET` — OIDC confidential client secret (optional)
 - `VDI_FRONTEND_ORIGIN` — CORS-allowed frontend origin / login redirect target (default `https://domain.tld`)
-- `VDI_ADMIN_SUBJECTS` — comma-separated OIDC subjects promoted to `admin` on login
+- `VDI_ADMIN_SUBJECTS` — comma-separated OIDC subjects, user names or emails promoted to `admin` on login
 - `VDI_DEFAULT_AGE` — age for first-time users (default `18`)
 - `VDI_LISTEN_ADDR` — default `:8080`
 - `VDI_IDLE_SECS` — agent idle shutdown seconds (default 1800)
@@ -56,7 +56,7 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 - All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migrate` (GORM AutoMigrate)
 
 ## Architecture boundaries
-- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), JWT verification (JWKS), first-login provisioning + admin promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
+- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), provider discovery (`/.well-known/openid-configuration`), JWT verification (JWKS), first-login provisioning + admin promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
 - `deploy/k8s/gateway.yaml` — Gateway API ListenerSet + HTTPRoute exposing the API at `api.domain.tld`; the frontend routes between the app and `/login` via a hash router (`web/src/main.js`)
 - `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
 - `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
@@ -68,6 +68,7 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 ## Gotchas
 - `server` binary at repo root is a build artifact; gitignored along with `web/node_modules` and `web/dist`.
 - Empty `VDI_OIDC_ISSUER` disables real OIDC verification (dev-only). Do not ship with it empty.
+- The OIDC provider must serve a discovery document at `{VDI_OIDC_ISSUER}/.well-known/openid-configuration`; endpoints are never hardcoded (Pocket ID uses `/authorize` + `/api/oidc/token`, Keycloak `/protocol/openid-connect/*`).
 - Frontend build output goes to `web/dist`; do not commit it.
 - Agent–VM interaction on the Proxmox side goes through the server (`/agent/vm/*`); agents must not call Proxmox directly.
 - When running the server in Kubernetes with `VDI_KUBERNETES_MODE=incluster`, the pod's ServiceAccount needs RBAC to list/patch Talos nodes.

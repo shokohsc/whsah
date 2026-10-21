@@ -106,7 +106,7 @@ func (s *Server) ensureUser(id Identity) (models.User, error) {
 	}
 	err := q.First(&u).Error
 	if err == nil {
-		if s.isAdminSubject(id.Subject) && u.Role != models.RoleAdmin {
+		if s.isAdminSubject(id) && u.Role != models.RoleAdmin {
 			u.Role = models.RoleAdmin
 			if err := s.db.Save(&u).Error; err != nil {
 				return u, err
@@ -126,7 +126,7 @@ func (s *Server) ensureUser(id Identity) (models.User, error) {
 		username = id.Subject
 	}
 	role := models.RoleGamer
-	if s.isAdminSubject(id.Subject) {
+	if s.isAdminSubject(id) {
 		role = models.RoleAdmin
 	}
 	u = models.User{Username: username, Email: email, Age: s.cfg.DefaultAge, Role: role}
@@ -140,9 +140,12 @@ func (s *Server) ensureUser(id Identity) (models.User, error) {
 	return u, nil
 }
 
-func (s *Server) isAdminSubject(subject string) bool {
+// isAdminSubject reports whether the identity is listed as an admin. The
+// subject is the provider's user ID (a UUID with Pocket ID), so the username
+// and email claims are matched as well.
+func (s *Server) isAdminSubject(id Identity) bool {
 	for _, a := range s.cfg.AdminSubjects {
-		if a == subject {
+		if a == id.Subject || (id.Username != "" && a == id.Username) || (id.Email != "" && a == id.Email) {
 			return true
 		}
 	}
@@ -170,11 +173,14 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 // oauth2Config builds the OIDC client config with the server's public redirect
 // URI and (optional) confidential client secret.
-func (s *Server) oauth2Config() *oauth2.Config {
-	oc := s.verifier.OAuth2()
+func (s *Server) oauth2Config(ctx context.Context) (*oauth2.Config, error) {
+	oc, err := s.verifier.OAuth2(ctx)
+	if err != nil {
+		return nil, err
+	}
 	oc.ClientSecret = s.cfg.OIDCClientSecret
 	oc.RedirectURL = strings.TrimRight(s.cfg.OIDCPublicURL, "/") + "/auth/callback"
-	return oc
+	return oc, nil
 }
 
 // frontendLogin builds the frontend login route URL. The route and its token
@@ -202,6 +208,11 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"state error"}`, http.StatusInternalServerError)
 		return
 	}
+	oc, err := s.oauth2Config(r.Context())
+	if err != nil {
+		http.Redirect(w, r, s.frontendLogin("oidc discovery failed", ""), http.StatusFound)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "vdi_oauth_state",
 		Value:    state,
@@ -211,7 +222,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   600,
 	})
-	http.Redirect(w, r, s.oauth2Config().AuthCodeURL(state), http.StatusFound)
+	http.Redirect(w, r, oc.AuthCodeURL(state), http.StatusFound)
 }
 
 // handleAuthCallback completes the flow: it validates the state cookie,
@@ -229,7 +240,12 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, s.frontendLogin(e, ""), http.StatusFound)
 		return
 	}
-	token, err := s.oauth2Config().Exchange(r.Context(), r.URL.Query().Get("code"))
+	oc, err := s.oauth2Config(r.Context())
+	if err != nil {
+		http.Redirect(w, r, s.frontendLogin("oidc discovery failed", ""), http.StatusFound)
+		return
+	}
+	token, err := oc.Exchange(r.Context(), r.URL.Query().Get("code"))
 	if err != nil {
 		http.Redirect(w, r, s.frontendLogin("token exchange failed", ""), http.StatusFound)
 		return
