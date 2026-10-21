@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,10 +18,23 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// cacheTTL is how long the provider discovery document and the JWKS are reused
+// before they are fetched again.
+const cacheTTL = 10 * time.Minute
+
 // OIDC holds OpenID Connect provider settings.
 type OIDC struct {
 	Issuer   string
 	ClientID string
+}
+
+// providerMetadata is the part of the OIDC discovery document the server uses.
+// Endpoint paths differ per provider (Keycloak, Pocket ID, ...), so they are
+// read from the document instead of being hardcoded.
+type providerMetadata struct {
+	AuthorizationEndpoint string `json:"authorization_endpoint"`
+	TokenEndpoint         string `json:"token_endpoint"`
+	JWKSURI               string `json:"jwks_uri"`
 }
 
 // Identity is the authenticated user derived from an OIDC ID token.
@@ -38,6 +52,8 @@ type Verifier struct {
 	keys     map[string]*rsa.PublicKey
 	mu       sync.RWMutex
 	fetched  time.Time
+	meta     *providerMetadata
+	metaAt   time.Time
 }
 
 func NewVerifier(oidc OIDC) *Verifier {
@@ -86,7 +102,9 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Identity, error) {
 		return Identity{}, fmt.Errorf("issuer mismatch: %q != %q", iss, v.issuer)
 	}
 	if v.clientID != "" {
-		if aud, _ := claims["aud"].(string); aud != v.clientID {
+		// "aud" is a string or an array of strings, depending on the provider.
+		aud, err := claims.GetAudience()
+		if err != nil || !slices.Contains(aud, v.clientID) {
 			return Identity{}, fmt.Errorf("audience mismatch")
 		}
 	}
@@ -102,35 +120,95 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Identity, error) {
 
 func (v *Verifier) ensureKeys(ctx context.Context) error {
 	v.mu.RLock()
-	fresh := len(v.keys) > 0 && time.Since(v.fetched) < 10*time.Minute
+	fresh := len(v.keys) > 0 && time.Since(v.fetched) < cacheTTL
 	v.mu.RUnlock()
 	if fresh {
 		return nil
 	}
+	// The JWKS URL comes from the discovery document. Fetch it before taking
+	// the lock, metadata() needs the lock itself. Without a discovery document
+	// the default location is used, as before.
+	meta, err := v.metadata(ctx)
+	if err != nil {
+		meta = &providerMetadata{}
+	}
+	jwksURL := meta.JWKSURI
+	if jwksURL == "" {
+		jwksURL = strings.TrimRight(v.issuer, "/") + "/.well-known/jwks.json"
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if len(v.keys) > 0 && time.Since(v.fetched) < 10*time.Minute {
+	if len(v.keys) > 0 && time.Since(v.fetched) < cacheTTL {
 		return nil
 	}
-	jwksURL := strings.TrimRight(v.issuer, "/") + "/.well-known/jwks.json"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURL, nil)
+	body, err := v.get(ctx, jwksURL)
 	if err != nil {
 		return err
+	}
+	keys, err := parseJWKS(body)
+	if err != nil {
+		return err
+	}
+	if len(keys) == 0 {
+		return fmt.Errorf("no usable signing key in %s", jwksURL)
+	}
+	v.keys = keys
+	v.fetched = time.Now()
+	return nil
+}
+
+// metadata returns the provider's OIDC discovery document, cached for cacheTTL.
+func (v *Verifier) metadata(ctx context.Context) (*providerMetadata, error) {
+	v.mu.RLock()
+	meta := v.meta
+	fresh := meta != nil && time.Since(v.metaAt) < cacheTTL
+	v.mu.RUnlock()
+	if fresh {
+		return meta, nil
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.meta != nil && time.Since(v.metaAt) < cacheTTL {
+		return v.meta, nil
+	}
+	body, err := v.get(ctx, strings.TrimRight(v.issuer, "/")+"/.well-known/openid-configuration")
+	if err != nil {
+		return nil, fmt.Errorf("oidc discovery: %w", err)
+	}
+	var m providerMetadata
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("oidc discovery: %w", err)
+	}
+	v.meta = &m
+	v.metaAt = time.Now()
+	return v.meta, nil
+}
+
+// get fetches a URL and returns the response body.
+func (v *Verifier) get(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
 	}
 	resp, err := v.client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: %s", url, resp.Status)
 	}
+	return io.ReadAll(resp.Body)
+}
+
+// parseJWKS decodes a JWKS document into RSA verification keys. A key without
+// a "use" field is accepted: Pocket ID omits it.
+func parseJWKS(body []byte) (map[string]*rsa.PublicKey, error) {
 	var jwks struct {
 		Keys []json.RawMessage `json:"keys"`
 	}
 	if err := json.Unmarshal(body, &jwks); err != nil {
-		return err
+		return nil, err
 	}
 	keys := map[string]*rsa.PublicKey{}
 	for _, raw := range jwks.Keys {
@@ -144,7 +222,7 @@ func (v *Verifier) ensureKeys(ctx context.Context) error {
 		if err := json.Unmarshal(raw, &jwk); err != nil {
 			continue
 		}
-		if jwk.Kty != "RSA" || jwk.Use != "sig" || jwk.Kid == "" {
+		if jwk.Kty != "RSA" || (jwk.Use != "" && jwk.Use != "sig") || jwk.Kid == "" {
 			continue
 		}
 		key, err := jwkToRSAPublicKey(jwk.N, jwk.E)
@@ -153,9 +231,7 @@ func (v *Verifier) ensureKeys(ctx context.Context) error {
 		}
 		keys[jwk.Kid] = key
 	}
-	v.keys = keys
-	v.fetched = time.Now()
-	return nil
+	return keys, nil
 }
 
 // jwkToRSAPublicKey decodes base64url JWK modulus/exponent into an RSA key.
@@ -177,14 +253,25 @@ func decodeBase64URL(s string) ([]byte, error) {
 }
 
 // ErrUnauthenticated is returned when no valid identity can be established.
-var ErrUnauthenticated = fmt.Errorf("unauthenticated")// OAuth2 returns an oauth2.Config for the authorization code flow.
-func (v *Verifier) OAuth2() *oauth2.Config {
+var ErrUnauthenticated = fmt.Errorf("unauthenticated")
+
+// OAuth2 returns an oauth2.Config for the authorization code flow. The
+// endpoints come from the provider's discovery document, so any OIDC provider
+// works (Keycloak, Pocket ID, ...) and not just the ones with fixed paths.
+func (v *Verifier) OAuth2(ctx context.Context) (*oauth2.Config, error) {
+	meta, err := v.metadata(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if meta.AuthorizationEndpoint == "" || meta.TokenEndpoint == "" {
+		return nil, fmt.Errorf("oidc discovery: no authorization/token endpoint at %s", v.issuer)
+	}
 	return &oauth2.Config{
 		ClientID:    v.clientID,
-		Endpoint:    oauth2.Endpoint{AuthURL: strings.TrimRight(v.issuer, "/") + "/protocol/openid-connect/auth", TokenURL: strings.TrimRight(v.issuer, "/") + "/protocol/openid-connect/token"},
+		Endpoint:    oauth2.Endpoint{AuthURL: meta.AuthorizationEndpoint, TokenURL: meta.TokenEndpoint},
 		Scopes:      []string{"openid", "email", "profile"},
 		RedirectURL: "",
-	}
+	}, nil
 }
 
 func bearerToken(r *http.Request) string {

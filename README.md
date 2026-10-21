@@ -36,11 +36,11 @@ Server optional env vars with defaults:
 
 - `VDI_BACKUP_INTERVAL` — default `7*24h` (once per week)
 - `VDI_VM_DELETION_DELAY` — default `30*24h` after `last_user_session` (1 month)
-- `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token)
+- `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token). Endpoints are read from the provider's discovery document (`{issuer}/.well-known/openid-configuration`), so Pocket ID, Keycloak, Authentik, ... all work.
 - `VDI_OIDC_PUBLIC_URL` — public API base URL used to build the OIDC redirect URI (default `https://api.domain.tld`; must match `VDI_OIDC_PUBLIC_URL`/auth/callback registered at the provider)
 - `VDI_OIDC_CLIENT_SECRET` — OIDC confidential client secret (optional)
 - `VDI_FRONTEND_ORIGIN` — frontend origin allowed by CORS and used as the login redirect target (default `https://domain.tld`)
-- `VDI_ADMIN_SUBJECTS` — comma-separated OIDC subjects/usernames provisioned (or promoted) to `admin` on login
+- `VDI_ADMIN_SUBJECTS` — comma-separated OIDC subjects, usernames or emails provisioned (or promoted) to `admin` on login
 - `VDI_DEFAULT_AGE` — age assigned to first-time users (default `18`)
 - `VDI_LISTEN_ADDR` — default `:8080`
 - `VDI_IDLE_SECS` — agent idle shutdown in seconds (default `1800`)
@@ -81,6 +81,26 @@ cd web && npm install && npm run build
 ```
 
 Tests: `go test ./...`
+
+## OIDC provider
+
+The server does not hardcode provider URLs: the authorization and token endpoints and the JWKS URL are read from the provider's discovery document (`{VDI_OIDC_ISSUER}/.well-known/openid-configuration`). Any provider that serves one works — Pocket ID, Keycloak, Authentik, ...
+
+### Pocket ID
+
+1. In Pocket ID, add an OIDC client: callback URL `https://api.domain.tld/auth/callback` (exactly the `VDI_OIDC_PUBLIC_URL` of the server), client type confidential, then allow the users who may sign in.
+2. Configure the server with the client credentials from the client's page:
+
+```
+VDI_OIDC_ISSUER=https://id.domain.tld
+VDI_OIDC_CLIENT_ID=<client id>
+VDI_OIDC_CLIENT_SECRET=<client secret>
+VDI_OIDC_PUBLIC_URL=https://api.domain.tld
+```
+
+3. List an admin in `VDI_ADMIN_SUBJECTS` — the Pocket ID user name or email works, the `sub` claim is the opaque user ID.
+
+The scopes requested are `openid email profile`; Pocket ID puts `preferred_username` (the user name) and `email` into the ID token, and the server uses them for the user name and email address.
 
 ## Kubernetes deployment
 
@@ -148,7 +168,7 @@ Games are configured and enriched asynchronously through a PostgreSQL-backed que
 ## Security model
 
 - OIDC/JWKS verification; empty `VDI_OIDC_ISSUER` = dev-only mode that accepts any bearer token. Do not ship with it empty.
-- First login provisions the user as `gamer` (age `VDI_DEFAULT_AGE`); OIDC subjects in `VDI_ADMIN_SUBJECTS` are provisioned — or promoted — to `admin`
+- First login provisions the user as `gamer` (age `VDI_DEFAULT_AGE`); identities (subject, user name or email) listed in `VDI_ADMIN_SUBJECTS` are provisioned — or promoted — to `admin`
 - CORS allows only `VDI_FRONTEND_ORIGIN`
 - RBAC middleware (anonymous/gamer/admin)
 - Agent token auth (`Bearer VDI_AGENT_TOKEN`) on `/agent/vm/*` endpoints — agents never talk to Proxmox directly
@@ -165,5 +185,6 @@ Games are configured and enriched asynchronously through a PostgreSQL-backed que
 - Frontend build output goes to `web/dist`; do not commit it.
 - No local DB is available, so integration tests cannot run without `VDI_DATABASE_DSN`.
 - Empty `VDI_OIDC_ISSUER` disables real OIDC verification (dev-only). Do not ship with it empty.
+- The OIDC provider must serve a discovery document at `{VDI_OIDC_ISSUER}/.well-known/openid-configuration`; login and token verification fail without it.
 - When running the server in Kubernetes with `VDI_KUBERNETES_MODE=incluster`, the pod's ServiceAccount needs RBAC to list/patch Talos nodes.
 - Every agent–VM interaction on the Proxmox side goes through the server (`/agent/vm/*`); agents must not call Proxmox directly.

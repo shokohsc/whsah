@@ -585,6 +585,20 @@ func TestEnsureUserAdminSubjectAndPromotion(t *testing.T) {
 	}
 }
 
+func TestEnsureUserAdminMatchedByUsername(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{DefaultAge: 18, AdminSubjects: []string{"alice"}})
+
+	// Pocket ID subjects are opaque IDs, so the username claim identifies the admin.
+	u, err := srv.ensureUser(Identity{Subject: "8f14e45f-ea1c-4a3b-9f2b-1b6f5f0a2c3d", Username: "alice"})
+	if err != nil {
+		t.Fatalf("ensureUser: %v", err)
+	}
+	if u.Role != models.RoleAdmin {
+		t.Fatalf("expected admin, got %s", u.Role)
+	}
+}
+
 func TestCORSAllowsFrontendOrigin(t *testing.T) {
 	db := testDB(t)
 	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{FrontendOrigin: "https://domain.tld"})
