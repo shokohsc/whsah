@@ -10,7 +10,7 @@
 - `go build ./...` — build everything
 - `go vet ./...` — vet
 - `go test ./...` — run tests
-- `cd web && npm install` then `npm run build` — frontend (Vite + Vue 3 + Bulma). The API base is `VITE_API_BASE` (empty in dev, where the dev server proxies the API paths to `http://localhost:8080`; `https://api.domain.tld` in production).
+- `cd web && npm install` then `npm run build` — frontend (Vite + Vue 3 + Bulma). The API base is derived at runtime from the domain the frontend is served from (`https://api.<host>`); in dev it is empty, where the dev server proxies the API paths to `http://localhost:8080`.
 
 Go module: `selfhosted-gaming-vdi`, go 1.26.0.
 

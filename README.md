@@ -117,7 +117,7 @@ All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migr
 
 ## API endpoints
 
-The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yaml`), not at a `domain.tld/api` path prefix. The frontend calls it via the API base URL baked in at build time (`VITE_API_BASE`).
+The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yaml`), not at a `domain.tld/api` path prefix. The frontend derives the API base URL at runtime from the domain it is served from (`api.<host>`), so one image works on any domain.
 
 - `GET /auth/login` — redirects to the OIDC provider (dev mode: straight back to the frontend `/login` route with a token); `GET /auth/callback` completes the flow and returns the ID token to the frontend
 - `GET/POST /games` — `PUT /games/{id}` (admin) updates `library_path`
