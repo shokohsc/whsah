@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"log/slog"
 
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,6 +15,13 @@ import (
 // Client manages Talos worker nodes via the Kubernetes API.
 type Client struct {
 	clientset kubernetes.Interface
+	logger    *slog.Logger
+}
+
+// WithLogger sets the logger used by the client.
+func (c *Client) WithLogger(l *slog.Logger) *Client {
+	c.logger = l
+	return c
 }
 
 func New(kubeconfig string) (*Client, error) {
@@ -29,12 +37,12 @@ func New(kubeconfig string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{clientset: clientset}, nil
+	return &Client{clientset: clientset, logger: slog.Default()}, nil
 }
 
 // NewWithClientset builds a Client backed by an existing clientset (for tests).
 func NewWithClientset(cs kubernetes.Interface) *Client {
-	return &Client{clientset: cs}
+	return &Client{clientset: cs, logger: slog.Default()}
 }
 
 // NewInCluster builds a Client using the in-cluster service account token.
@@ -47,12 +55,12 @@ func NewInCluster() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{clientset: clientset}, nil
+	return &Client{clientset: clientset, logger: slog.Default()}, nil
 }
 
 // Cordon marks a node unschedulable.
 func (c *Client) Cordon(node string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		n, err := c.clientset.CoreV1().Nodes().Get(context.Background(), node, metav1.GetOptions{})
 		if err != nil {
 			return err
@@ -61,6 +69,12 @@ func (c *Client) Cordon(node string) error {
 		_, err = c.clientset.CoreV1().Nodes().Update(context.Background(), n, metav1.UpdateOptions{})
 		return err
 	})
+	if err != nil {
+		c.logger.Error("node cordon failed", "node", node, "err", err)
+		return err
+	}
+	c.logger.Info("node cordoned", "node", node)
+	return nil
 }
 
 // Drain evicts all pods from a node (excluding DaemonSet-managed mirror/static pods).
@@ -69,6 +83,7 @@ func (c *Client) Drain(node string) error {
 		FieldSelector: "spec.nodeName=" + node,
 	})
 	if err != nil {
+		c.logger.Error("node drain failed", "node", node, "err", err)
 		return err
 	}
 	for _, p := range pods.Items {
@@ -79,10 +94,16 @@ func (c *Client) Drain(node string) error {
 			ObjectMeta: metav1.ObjectMeta{Name: p.Name, Namespace: p.Namespace},
 		})
 	}
+	c.logger.Info("node drained", "node", node, "pods", len(pods.Items))
 	return nil
 }
 
 // Delete removes the Node object.
 func (c *Client) Delete(node string) error {
-	return c.clientset.CoreV1().Nodes().Delete(context.Background(), node, metav1.DeleteOptions{})
+	if err := c.clientset.CoreV1().Nodes().Delete(context.Background(), node, metav1.DeleteOptions{}); err != nil {
+		c.logger.Error("node delete failed", "node", node, "err", err)
+		return err
+	}
+	c.logger.Info("node deleted", "node", node)
+	return nil
 }

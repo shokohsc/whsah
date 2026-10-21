@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,11 +14,13 @@ import (
 	"selfhosted-gaming-vdi/db"
 	"selfhosted-gaming-vdi/internal/backup"
 	"selfhosted-gaming-vdi/internal/k8s"
+	"selfhosted-gaming-vdi/internal/logging"
 	"selfhosted-gaming-vdi/internal/proxmox"
 	"selfhosted-gaming-vdi/internal/server"
 )
 
 func main() {
+	logger := logging.Setup("server")
 	cfg := config.Default()
 
 	if v := os.Getenv("VDI_DATABASE_DSN"); v != "" {
@@ -96,10 +97,12 @@ func main() {
 
 	gormDB, err := db.Open(cfg)
 	if err != nil {
-		log.Fatalf("db open: %v", err)
+		logger.Error("db open failed", "err", logging.SafeError(err))
+		os.Exit(1)
 	}
 	if err := db.Migrate(gormDB); err != nil {
-		log.Fatalf("db migrate: %v", err)
+		logger.Error("db migrate failed", "err", logging.SafeError(err))
+		os.Exit(1)
 	}
 
 	// Proxmox client: token or password auth, nil if not configured.
@@ -111,6 +114,7 @@ func main() {
 		default:
 			px = proxmox.New(cfg.ProxmoxBase, cfg.ProxmoxNode, cfg.ProxmoxToken)
 		}
+		px = px.WithLogger(logger)
 	}
 
 	// Kubernetes client: in-cluster service account or kubeconfig.
@@ -126,15 +130,15 @@ func main() {
 	}
 	if inCluster {
 		if c, err := k8s.NewInCluster(); err == nil {
-			kube = c
+			kube = c.WithLogger(logger)
 		} else {
-			log.Printf("k8s incluster: %v", err)
+			logger.Warn("k8s incluster client unavailable", "err", logging.SafeError(err))
 		}
 	} else if cfg.Kubeconfig != "" || os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
 		if c, err := k8s.New(cfg.Kubeconfig); err == nil {
-			kube = c
+			kube = c.WithLogger(logger)
 		} else {
-			log.Printf("k8s kubeconfig: %v", err)
+			logger.Warn("k8s kubeconfig client unavailable", "err", logging.SafeError(err))
 		}
 	}
 
@@ -144,10 +148,10 @@ func main() {
 	}
 	verifier := server.NewVerifier(oidc)
 
-	srv := server.New(gormDB, verifier, px, cfg)
+	srv := server.New(gormDB, verifier, px, cfg).WithLogger(logger)
 
 	// Backup scheduler + VM deletion delay (runs in the server).
-	go backup.New(gormDB, px, cfg).Run(context.Background())
+	go backup.New(gormDB, px, cfg).WithLogger(logger).Run(context.Background())
 
 	_ = kube // Talos node cordon/drain/delete invoked by admin flows.
 
@@ -155,9 +159,10 @@ func main() {
 	httpSrv := &http.Server{Addr: addr, Handler: srv.Routes()}
 
 	go func() {
-		log.Printf("server listening on %s", addr)
+		logger.Info("server listening", "addr", addr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http server: %v", err)
+			logger.Error("http server failed", "err", logging.SafeError(err))
+			os.Exit(1)
 		}
 	}()
 

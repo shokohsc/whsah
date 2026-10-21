@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -10,6 +10,7 @@ import (
 
 	"selfhosted-gaming-vdi/config"
 	"selfhosted-gaming-vdi/internal/agent"
+	"selfhosted-gaming-vdi/internal/logging"
 )
 
 func main() {
@@ -28,18 +29,18 @@ func main() {
 	share := os.Getenv("VDI_SMB_SHARE")
 	agentToken := os.Getenv("VDI_AGENT_TOKEN")
 
-	a := agent.New(serverURL, vmID, gameLib, agentToken)
-
-	// Loki remote logging (optional).
+	// Loki remote logging (optional): JSON to stdout plus a Loki stream.
+	var extra []slog.Handler
 	if lokiURL := os.Getenv("VDI_LOKI_URL"); lokiURL != "" {
-		a.WithLogger(agent.NewLogger(agent.NewLoki(lokiURL, vmID)))
-	} else {
-		a.WithLogger(agent.NewLogger(nil))
+		extra = append(extra, agent.NewLoki(lokiURL, vmID, logging.Level()))
 	}
+	logger := logging.Setup("agent", extra...)
+
+	a := agent.New(serverURL, vmID, gameLib, agentToken).WithLogger(logger)
 
 	if share != "" && creds != "" {
 		if err := a.MountSMB(share, creds); err != nil {
-			log.Printf("smb mount: %v", err)
+			logger.Error("smb mount failed", "err", logging.SafeError(err))
 		}
 	}
 
@@ -47,11 +48,11 @@ func main() {
 	defer stop()
 
 	if err := a.Register(ctx); err != nil {
-		log.Printf("register: %v", err)
+		logger.Error("register failed", "err", logging.SafeError(err))
 	}
 
 	if err := a.StartStreaming(); err != nil {
-		log.Printf("streaming: %v", err)
+		logger.Error("streaming failed", "err", logging.SafeError(err))
 	}
 
 	// Shutdown after idle (default 30 min) unless overridden.
@@ -64,5 +65,5 @@ func main() {
 	a.ShutdownAfterInactivity(idleSecs)
 
 	<-ctx.Done()
-	log.Println("agent shutting down")
+	logger.Info("agent shutting down")
 }

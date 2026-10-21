@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -80,8 +82,8 @@ func TestLokiPayload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	loki := NewLoki(srv.URL, "vm-42")
-	loki.push(LevelInfo, "hello world")
+	loki := NewLoki(srv.URL, "vm-42", slog.LevelDebug)
+	slog.New(loki).Info("hello world", "vm_id", "vm-42")
 	// wait for async send
 	time.Sleep(100 * time.Millisecond)
 
@@ -103,15 +105,41 @@ func TestLokiPayload(t *testing.T) {
 	if len(parsed.Streams[0].Values) != 1 {
 		t.Fatalf("expected 1 value, got %d", len(parsed.Streams[0].Values))
 	}
-	if !strings.Contains(parsed.Streams[0].Values[0][1], "[info] hello world") {
-		t.Fatalf("unexpected log line: %q", parsed.Streams[0].Values[0][1])
+	line := parsed.Streams[0].Values[0][1]
+	for _, want := range []string{`"level":"INFO"`, `"msg":"hello world"`, `"vm_id":"vm-42"`} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("log line %q does not contain %q", line, want)
+		}
 	}
 }
 
-func TestLoggerLevels(t *testing.T) {
-	lg := NewLogger(nil)
-	lg.Debug("debug msg")
-	lg.Info("info msg")
-	lg.Warn("warn msg")
-	lg.Error("error msg")
+func TestLokiLevelFilter(t *testing.T) {
+	loki := NewLoki("http://127.0.0.1:1", "vm-42", slog.LevelWarn)
+	if loki.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatal("info records must be dropped at warn level")
+	}
+	if !loki.Enabled(context.Background(), slog.LevelWarn) {
+		t.Fatal("warn records must be kept at warn level")
+	}
+	disabled := NewLoki("", "vm-42", slog.LevelDebug)
+	if disabled.Enabled(context.Background(), slog.LevelError) {
+		t.Fatal("a Loki without URL must not accept records")
+	}
+}
+
+func TestAgentLogsRegister(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	a := New(srv.URL, "vm-42", "/tmp/gamelib", "").WithLogger(logger)
+	if err := a.Register(context.Background()); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"msg":"registered with server"`) {
+		t.Fatalf("register was not logged: %s", buf.String())
+	}
 }
