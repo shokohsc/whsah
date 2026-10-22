@@ -18,13 +18,13 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 
 ## Architecture boundaries
 
-- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), JWT verification (JWKS), first-login user provisioning and admin-subject promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
+- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), JWT verification (JWKS), first-login user provisioning and admin-subject promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/library/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
 - `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
 - `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
 - `internal/backup` — periodic backup tick + VM deletion after `last_user_session + delay`
 - `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown, Loki logging, VM ops via server only (never direct Proxmox)
 - `internal/firewall` — ephemeral co-op pinholes with TTL
-- `internal/worker` — PostgreSQL-backed job queue: claims pending game jobs (config generation, metadata retrieval) and writes results back to `Game`
+- `internal/worker` — PostgreSQL-backed job queue: claims pending game jobs (config generation, metadata retrieval, library scan) and writes results back to `Game`
 
 ## Quickstart
 
@@ -66,9 +66,9 @@ Agent env vars:
 - `VDI_LOKI_URL` — remote Loki endpoint for agent logs (optional)
 
 Worker env vars (`cmd/worker`):
-
 - `VDI_DATABASE_DSN` — PostgreSQL connection string (queue + game state; required)
 - `VDI_METADATA_URL` — HTTP metadata source for `metadata` jobs: `GET {VDI_METADATA_URL}/games?title={title}` returns the metadata JSON body (empty = metadata retrieval fails as "not configured")
+- `VDI_LIBRARY_PATH` — directory holding the game files; `library` jobs scan it (empty = library jobs fail as "not configured")
 
 Build, run, frontend:
 
@@ -133,7 +133,7 @@ kubectl create secret generic vdi-agent \
 - `User` — roles `anonymous` / `gamer` / `admin`
 - `Game` — title, metadata JSON, `library_path`, embedded `VMConfig` (`cpu_cores`, `ram_size` MB, `disk_size` GB), `pegi_rating`
 - `Session` — user/game/vm, `backups`, `last_user_session`, per-session VM config overrides
-- `GameJob` — queued work on a game: `kind` (`config` / `metadata`), `status` (`pending` / `processing` / `done` / `failed`), `payload`, `result`, `error`, `attempts`. The queue lives in PostgreSQL, so any number of workers can share it.
+- `GameJob` — queued work on a game: `kind` (`config` / `metadata` / `library`), `status` (`pending` / `processing` / `done` / `failed`), `payload`, `result`, `error`, `attempts`. The queue lives in PostgreSQL, so any number of workers can share it.
 
 All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migrate` (GORM AutoMigrate).
 
@@ -145,6 +145,7 @@ The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yam
 - `GET/POST /games` — `PUT /games/{id}` (admin) updates `library_path`
 - `PUT /users/{id}` (admin) — change a user's `role` (`anonymous` / `gamer` / `admin`)
 - `POST /games/{id}/jobs` (admin) — enqueue a game job (`kind`: `config` or `metadata`, optional `payload`); returns `202` with the queued job
+- `POST /library/jobs` (admin) — start the workers on the game files in the library; returns `202` with the queued `library` job
 - `GET /games/{id}/jobs` (admin) — list a game's jobs
 - `GET /jobs/{id}` — poll a job's `status`, `result`, `error`
 - `GET /me` — current user id/username/role/age
@@ -164,6 +165,12 @@ Games are configured and enriched asynchronously through a PostgreSQL-backed que
 3. `config` jobs generate the game's `VMConfig` — from the job `payload` when provided, otherwise derived from the PEGI rating — and write it back to the `Game` row.
 4. `metadata` jobs retrieve metadata from `VDI_METADATA_URL` (`GET {VDI_METADATA_URL}/games?title={title}`) and write it to `Game.metadata`.
 5. Results land in `GameJob.result`, failures in `GameJob.error`; clients poll `GET /jobs/{id}`.
+
+### Processing the library
+
+An admin starts the workers on the game files in the library with `POST /library/jobs`. The queued `library` job is claimed by a worker, which scans `VDI_LIBRARY_PATH`: every directory in it is a game, registered with the library path as its `library_path` and queued for a `config` and a `metadata` job. A game an admin already created keeps its PEGI rating, only its library path is refreshed. Games found in the library get the strictest PEGI rating (`18`) until an admin sets the real one.
+
+The worker needs the library mounted at `VDI_LIBRARY_PATH` (mount the share or a PVC with the game files into the worker pod).
 
 ## Security model
 

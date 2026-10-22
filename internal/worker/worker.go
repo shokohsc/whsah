@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -64,10 +66,11 @@ func (f *HTTPFetcher) FetchMetadata(ctx context.Context, title string) (string, 
 // Service is the PostgreSQL-backed worker queue for game jobs. Any number of
 // workers may run against the same database.
 type Service struct {
-	db       *gorm.DB
-	fetcher  MetadataFetcher
-	interval time.Duration
-	logger   *slog.Logger
+	db          *gorm.DB
+	fetcher     MetadataFetcher
+	libraryPath string
+	interval    time.Duration
+	logger      *slog.Logger
 }
 
 func New(db *gorm.DB, fetcher MetadataFetcher, interval time.Duration) *Service {
@@ -86,9 +89,18 @@ func (s *Service) WithLogger(l *slog.Logger) *Service {
 	return s
 }
 
+// WithLibraryPath sets the directory holding the game files. Library jobs
+// scan it for games.
+func (s *Service) WithLibraryPath(path string) *Service {
+	s.libraryPath = path
+	return s
+}
+
 // Enqueue queues a job for a game. payload is marshalled to JSON (optional).
 func Enqueue(db *gorm.DB, gameID uint, kind models.JobKind, payload any) (*models.GameJob, error) {
-	if kind != models.JobKindConfig && kind != models.JobKindMetadata {
+	switch kind {
+	case models.JobKindConfig, models.JobKindMetadata, models.JobKindLibrary:
+	default:
 		return nil, fmt.Errorf("unknown job kind %q", kind)
 	}
 	var p string
@@ -167,6 +179,11 @@ func (s *Service) claim(ctx context.Context) (*models.GameJob, error) {
 }
 
 func (s *Service) process(ctx context.Context, job *models.GameJob) {
+	if job.Kind == models.JobKindLibrary {
+		result, err := s.applyLibrary(ctx)
+		s.finish(ctx, job, result, err)
+		return
+	}
 	var game models.Game
 	if err := s.db.WithContext(ctx).First(&game, job.GameID).Error; err != nil {
 		s.finish(ctx, job, "", fmt.Errorf("game %d: %w", job.GameID, err))
@@ -241,6 +258,84 @@ func (s *Service) applyMetadata(ctx context.Context, game *models.Game) (string,
 		return "", err
 	}
 	return meta, nil
+}
+
+// defaultPEGIRating is the rating a game discovered in the library gets until
+// an admin sets the real one: the strictest rating keeps it out of reach.
+const defaultPEGIRating = "18"
+
+// libraryResult summarizes a library scan.
+type libraryResult struct {
+	LibraryPath string `json:"library_path"`
+	Games       int    `json:"games"`
+	Created     int    `json:"created"`
+	Updated     int    `json:"updated"`
+	Jobs        int    `json:"jobs"`
+}
+
+// applyLibrary processes the game files in the library: every directory is a
+// game, which is registered and queued for a config and a metadata job.
+func (s *Service) applyLibrary(ctx context.Context) (string, error) {
+	if s.libraryPath == "" {
+		return "", errors.New("library path not configured")
+	}
+	entries, err := os.ReadDir(s.libraryPath)
+	if err != nil {
+		return "", fmt.Errorf("read library: %w", err)
+	}
+	res := libraryResult{LibraryPath: s.libraryPath}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		path := filepath.Join(s.libraryPath, name)
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		game, created, err := s.upsertGame(ctx, name, path)
+		if err != nil {
+			return "", err
+		}
+		res.Games++
+		if created {
+			res.Created++
+		} else {
+			res.Updated++
+		}
+		for _, kind := range []models.JobKind{models.JobKindConfig, models.JobKindMetadata} {
+			if _, err := Enqueue(s.db, game.ID, kind, nil); err != nil {
+				return "", err
+			}
+			res.Jobs++
+		}
+		s.logger.Info("library game processed", "title", name, "game_id", game.ID, "library_path", path)
+	}
+	b, _ := json.Marshal(res)
+	return string(b), nil
+}
+
+// upsertGame registers the game found in the library, keeping the row an
+// admin already created and refreshing its library path.
+func (s *Service) upsertGame(ctx context.Context, title, path string) (*models.Game, bool, error) {
+	var game models.Game
+	err := s.db.WithContext(ctx).Where("title = ?", title).First(&game).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		game = models.Game{Title: title, PEGIRating: defaultPEGIRating, LibraryPath: path}
+		if err := s.db.WithContext(ctx).Create(&game).Error; err != nil {
+			return nil, false, err
+		}
+		return &game, true, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	game.LibraryPath = path
+	if err := s.db.WithContext(ctx).Save(&game).Error; err != nil {
+		return nil, false, err
+	}
+	return &game, false, nil
 }
 
 // vmConfigFromPEGI maps a PEGI rating to a default VM configuration.

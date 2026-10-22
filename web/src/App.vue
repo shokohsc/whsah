@@ -84,6 +84,14 @@
       <div v-if="can.manageGames" class="box mt-4" :class="themeClass">
         <h2 class="subtitle">Games (admin)</h2>
         <div class="field is-grouped">
+          <div class="control">
+            <button class="button is-info" @click="processLibrary">Process library</button>
+          </div>
+          <div class="control is-expanded">
+            <p class="help">Starts the workers: they scan the library and process every game they find.</p>
+          </div>
+        </div>
+        <div class="field is-grouped">
           <div class="control is-expanded">
             <input class="input" v-model="newGame.title" placeholder="Title" />
           </div>
@@ -344,6 +352,17 @@ async function enqueueJob(g, kind) {
       body: JSON.stringify({ kind }),
     })
     msg.value = "Job #" + job.id + " queued (" + kind + ")"
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function processLibrary() {
+  error.value = ""
+  msg.value = ""
+  try {
+    const job = await api("/library/jobs", { method: "POST" })
+    msg.value = "Library job #" + job.id + " queued: the workers process the games in the library"
   } catch (e) {
     error.value = e.message
   }
