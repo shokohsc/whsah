@@ -14,7 +14,14 @@ const (
 	JobKindConfig JobKind = "config"
 	// JobKindMetadata retrieves the game's metadata from the metadata source.
 	JobKindMetadata JobKind = "metadata"
+	// JobKindLibrary processes the game files in the library: it registers the
+	// games it finds and queues a config and a metadata job for each of them.
+	JobKindLibrary JobKind = "library"
 )
+
+// LibraryJobGameID is the game id of library-wide jobs, which are not bound
+// to a single game.
+const LibraryJobGameID = 0
 
 // JobStatus is the lifecycle state of a queued game job.
 type JobStatus string

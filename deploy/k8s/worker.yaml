@@ -11,6 +11,9 @@ data:
   #   GET {VDI_METADATA_URL}/games?title={title} returns the metadata JSON body.
   # Leave empty to fail metadata jobs as "not configured".
   VDI_METADATA_URL: ""
+  # VDI_LIBRARY_PATH — directory holding the game files. `library` jobs scan
+  # it, so the library must be mounted into the worker at this path.
+  VDI_LIBRARY_PATH: "/mnt/games"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -47,6 +50,11 @@ spec:
                 configMapKeyRef:
                   name: vdi-worker-config
                   key: VDI_METADATA_URL
+            - name: VDI_LIBRARY_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-worker-config
+                  key: VDI_LIBRARY_PATH
           resources:
             requests:
               cpu: 50m

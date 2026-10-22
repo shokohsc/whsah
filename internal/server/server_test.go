@@ -468,6 +468,65 @@ func TestEnqueueGameJob(t *testing.T) {
 	}
 }
 
+func TestEnqueueLibraryJob(t *testing.T) {
+	db := testDB(t)
+	seedUsers(t, db)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	r := httptest.NewRequest(http.MethodPost, "/library/jobs", nil)
+	r = withUserContext(r, "admin")
+	w := httptest.NewRecorder()
+	srv.handleEnqueueLibraryJob(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("library job status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+	var job models.GameJob
+	if err := json.Unmarshal(w.Body.Bytes(), &job); err != nil {
+		t.Fatalf("decode job: %v", err)
+	}
+	if job.Kind != models.JobKindLibrary || job.Status != models.JobStatusPending {
+		t.Fatalf("unexpected job: %+v", job)
+	}
+	if job.GameID != models.LibraryJobGameID {
+		t.Fatalf("game id = %d, want %d", job.GameID, models.LibraryJobGameID)
+	}
+}
+
+func TestLibraryJobRouteRequiresAdmin(t *testing.T) {
+	db := testDB(t)
+	seedUsers(t, db)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	// no token -> 401
+	r := httptest.NewRequest(http.MethodPost, "/library/jobs", nil)
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("no token status = %d, want 401", w.Code)
+	}
+
+	// gamer -> 403
+	r = httptest.NewRequest(http.MethodPost, "/library/jobs", nil)
+	r.Header.Set("Authorization", "Bearer any")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("gamer status = %d, want 403", w.Code)
+	}
+
+	// admin -> 202 (dev mode maps every token to the dev-user identity)
+	if err := db.Model(&models.User{}).Where("username = ?", "dev-user").Update("role", models.RoleAdmin).Error; err != nil {
+		t.Fatalf("promote user: %v", err)
+	}
+	r = httptest.NewRequest(http.MethodPost, "/library/jobs", nil)
+	r.Header.Set("Authorization", "Bearer any")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("admin status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestListGameJobs(t *testing.T) {
 	db := testDB(t)
 	seedGames(t, db)
@@ -631,10 +690,17 @@ func TestJobRoutesAuth(t *testing.T) {
 	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 	job, _ := worker.Enqueue(db, 1, models.JobKindConfig, nil)
 
-	// POST /games/{id}/jobs requires admin (gamer forbidden, no token forbidden)
+	// POST /games/{id}/jobs requires a token and the admin role
 	r := httptest.NewRequest(http.MethodPost, "/games/1/jobs", nil)
-	r = withUserContext(r, "dev-user")
 	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("no token enqueue status = %d, want 401", w.Code)
+	}
+
+	r = httptest.NewRequest(http.MethodPost, "/games/1/jobs", nil)
+	r.Header.Set("Authorization", "Bearer any")
+	w = httptest.NewRecorder()
 	srv.Routes().ServeHTTP(w, r)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("gamer enqueue status = %d, want 403", w.Code)

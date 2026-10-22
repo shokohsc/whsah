@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -158,6 +160,120 @@ func TestProcessMissingGame(t *testing.T) {
 	svc := New(db, nil, time.Millisecond)
 
 	job, err := Enqueue(db, 999, models.JobKindConfig, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := svc.tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	var failed models.GameJob
+	if err := db.First(&failed, job.ID).Error; err != nil {
+		t.Fatalf("job: %v", err)
+	}
+	if failed.Status != models.JobStatusFailed {
+		t.Fatalf("expected failed, got %s", failed.Status)
+	}
+}
+
+func TestProcessLibrary(t *testing.T) {
+	db := testDB(t)
+	lib := t.TempDir()
+	for _, dir := range []string{"Kids Game", "Adult Game"} {
+		if err := os.Mkdir(filepath.Join(lib, dir), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	// A file and a hidden directory are not games.
+	if err := os.WriteFile(filepath.Join(lib, "setup.exe"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(lib, ".hidden"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	svc := New(db, nil, time.Millisecond).WithLibraryPath(lib)
+	job, err := Enqueue(db, models.LibraryJobGameID, models.JobKindLibrary, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := svc.tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	var done models.GameJob
+	if err := db.First(&done, job.ID).Error; err != nil {
+		t.Fatalf("job: %v", err)
+	}
+	if done.Status != models.JobStatusDone {
+		t.Fatalf("expected done, got %s (%s)", done.Status, done.Error)
+	}
+
+	var games []models.Game
+	if err := db.Find(&games).Error; err != nil {
+		t.Fatalf("games: %v", err)
+	}
+	if len(games) != 2 {
+		t.Fatalf("expected 2 games, got %d", len(games))
+	}
+	for _, g := range games {
+		if g.LibraryPath != filepath.Join(lib, g.Title) {
+			t.Fatalf("unexpected library path for %q: %q", g.Title, g.LibraryPath)
+		}
+		if g.PEGIRating == "" {
+			t.Fatalf("game %q has no pegi rating", g.Title)
+		}
+	}
+
+	// Every game is queued for a config and a metadata job.
+	var jobs []models.GameJob
+	if err := db.Where("kind IN ?", []models.JobKind{models.JobKindConfig, models.JobKindMetadata}).Find(&jobs).Error; err != nil {
+		t.Fatalf("jobs: %v", err)
+	}
+	if len(jobs) != 4 {
+		t.Fatalf("expected 4 jobs, got %d", len(jobs))
+	}
+}
+
+func TestProcessLibraryKeepsExistingGame(t *testing.T) {
+	db := testDB(t)
+	game := models.Game{Title: "Kids Game", PEGIRating: "3", LibraryPath: "/smb/kids"}
+	if err := db.Create(&game).Error; err != nil {
+		t.Fatalf("create game: %v", err)
+	}
+	lib := t.TempDir()
+	if err := os.Mkdir(filepath.Join(lib, "Kids Game"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	svc := New(db, nil, time.Millisecond).WithLibraryPath(lib)
+	if _, err := Enqueue(db, models.LibraryJobGameID, models.JobKindLibrary, nil); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := svc.tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	var count int64
+	db.Model(&models.Game{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("expected 1 game, got %d", count)
+	}
+	var got models.Game
+	db.First(&got, game.ID)
+	if got.PEGIRating != "3" {
+		t.Fatalf("rating changed to %q", got.PEGIRating)
+	}
+	if got.LibraryPath != filepath.Join(lib, "Kids Game") {
+		t.Fatalf("library path = %q", got.LibraryPath)
+	}
+}
+
+func TestProcessLibraryWithoutPath(t *testing.T) {
+	db := testDB(t)
+	svc := New(db, nil, time.Millisecond)
+
+	job, err := Enqueue(db, models.LibraryJobGameID, models.JobKindLibrary, nil)
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}

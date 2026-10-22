@@ -49,10 +49,11 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /auth/login", s.handleAuthLogin)
 	mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
 	mux.HandleFunc("GET /games", s.handleListGames)
-	mux.Handle("POST /games", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateGame)))
-	mux.Handle("PUT /games/{id}", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleUpdateGame)))
-	mux.Handle("POST /games/{id}/jobs", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleEnqueueGameJob)))
-	mux.Handle("GET /games/{id}/jobs", s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListGameJobs)))
+	mux.Handle("POST /games", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateGame))))
+	mux.Handle("PUT /games/{id}", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleUpdateGame))))
+	mux.Handle("POST /games/{id}/jobs", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleEnqueueGameJob))))
+	mux.Handle("GET /games/{id}/jobs", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListGameJobs))))
+	mux.Handle("POST /library/jobs", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleEnqueueLibraryJob))))
 	mux.Handle("GET /jobs/{id}", s.auth(http.HandlerFunc(s.handleGetJob)))
 	mux.Handle("GET /sessions", s.auth(http.HandlerFunc(s.handleListSessions)))
 	mux.Handle("POST /sessions", s.auth(http.HandlerFunc(s.handleCreateSession)))
@@ -425,6 +426,20 @@ func (s *Server) handleEnqueueGameJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("game job enqueued", "job_id", job.ID, "game_id", g.ID, "kind", req.Kind)
+	s.writeJSON(w, http.StatusAccepted, job)
+}
+
+// handleEnqueueLibraryJob queues the processing of the game files in the
+// library: a worker scans the library directory, registers the games it finds
+// and queues a config and a metadata job for each of them.
+func (s *Server) handleEnqueueLibraryJob(w http.ResponseWriter, r *http.Request) {
+	job, err := worker.Enqueue(s.db, models.LibraryJobGameID, models.JobKindLibrary, nil)
+	if err != nil {
+		s.logger.Error("library job enqueue failed", "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("library job enqueued", "job_id", job.ID)
 	s.writeJSON(w, http.StatusAccepted, job)
 }
 

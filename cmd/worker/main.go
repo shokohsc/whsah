@@ -24,6 +24,9 @@ func main() {
 	if v := os.Getenv("VDI_METADATA_URL"); v != "" {
 		cfg.MetadataURL = v
 	}
+	if v := os.Getenv("VDI_LIBRARY_PATH"); v != "" {
+		cfg.LibraryPath = v
+	}
 
 	gormDB, err := db.Open(cfg)
 	if err != nil {
@@ -35,7 +38,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	svc := worker.New(gormDB, &worker.HTTPFetcher{BaseURL: cfg.MetadataURL}, worker.DefaultPollInterval).WithLogger(logger)
+	svc := worker.New(gormDB, &worker.HTTPFetcher{BaseURL: cfg.MetadataURL}, worker.DefaultPollInterval).WithLogger(logger).WithLibraryPath(cfg.LibraryPath)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
