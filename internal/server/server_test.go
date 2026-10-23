@@ -31,7 +31,7 @@ func testDB(t *testing.T) *gorm.DB {
 		t.Fatalf("db.DB: %v", err)
 	}
 	sqlDB.SetMaxOpenConns(1)
-	if err := db.AutoMigrate(&models.User{}, &models.Game{}, &models.Session{}, &models.GameJob{}); err != nil {
+	if err := db.AutoMigrate(&models.User{}, &models.Game{}, &models.Session{}, &models.GameJob{}, &models.LibraryPath{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db
@@ -163,11 +163,11 @@ func TestCreateSessionVMConfigOverride(t *testing.T) {
 	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
 
 	r := httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{
-		"game_id":        1,
-		"vm_id":          "vm-override",
-		"cpu_cores":      8,
-		"ram_size":       16384,
-		"disk_size":      512,
+		"game_id":   1,
+		"vm_id":     "vm-override",
+		"cpu_cores": 8,
+		"ram_size":  16384,
+		"disk_size": 512,
 	}))
 	r = withUserContext(r, "dev-user")
 	w := httptest.NewRecorder()
@@ -524,6 +524,97 @@ func TestLibraryJobRouteRequiresAdmin(t *testing.T) {
 	srv.Routes().ServeHTTP(w, r)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("admin status = %d, want 202; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestLibraryPathsCRUD(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	r := httptest.NewRequest(http.MethodPost, "/library/paths", reqBody(map[string]any{"category": "isos", "path": "/games/isos"}))
+	w := httptest.NewRecorder()
+	srv.handleCreateLibraryPath(w, r)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201; body=%s", w.Code, w.Body.String())
+	}
+	var lib models.LibraryPath
+	if err := json.Unmarshal(w.Body.Bytes(), &lib); err != nil {
+		t.Fatalf("decode library path: %v", err)
+	}
+	if lib.Category != models.CategoryISOs || lib.Path != "/games/isos" {
+		t.Fatalf("unexpected library path: %+v", lib)
+	}
+
+	r = httptest.NewRequest(http.MethodPost, "/library/paths", reqBody(map[string]any{"category": "isos", "path": "/games/isos"}))
+	w = httptest.NewRecorder()
+	srv.handleCreateLibraryPath(w, r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("duplicate status = %d, want 409", w.Code)
+	}
+
+	r = httptest.NewRequest(http.MethodPost, "/library/paths", reqBody(map[string]any{"category": "other", "path": "/games/other"}))
+	w = httptest.NewRecorder()
+	srv.handleCreateLibraryPath(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid category status = %d, want 400", w.Code)
+	}
+
+	r = httptest.NewRequest(http.MethodGet, "/library/paths", nil)
+	w = httptest.NewRecorder()
+	srv.handleListLibraryPaths(w, r)
+	var paths []models.LibraryPath
+	if err := json.Unmarshal(w.Body.Bytes(), &paths); err != nil {
+		t.Fatalf("decode paths: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 path, got %d", len(paths))
+	}
+
+	r = httptest.NewRequest(http.MethodDelete, "/library/paths/1", nil)
+	r.SetPathValue("id", "1")
+	w = httptest.NewRecorder()
+	srv.handleDeleteLibraryPath(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want 204", w.Code)
+	}
+	var count int64
+	db.Model(&models.LibraryPath{}).Count(&count)
+	if count != 0 {
+		t.Fatalf("expected 0 paths, got %d", count)
+	}
+}
+
+func TestResetLibrary(t *testing.T) {
+	db := testDB(t)
+	seedGames(t, db)
+	db.Create(&models.LibraryPath{Category: models.CategoryRepacks, Path: "/games/repacks"})
+	worker.Enqueue(db, 1, models.JobKindConfig, nil)
+	worker.Enqueue(db, 1, models.JobKindMetadata, nil)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	r := httptest.NewRequest(http.MethodDelete, "/library", nil)
+	w := httptest.NewRecorder()
+	srv.handleResetLibrary(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	var out map[string]int64
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode reset: %v", err)
+	}
+	if out["games"] != 3 || out["jobs"] != 2 {
+		t.Fatalf("unexpected reset counts: %+v", out)
+	}
+
+	var games, jobs, paths int64
+	db.Model(&models.Game{}).Count(&games)
+	db.Model(&models.GameJob{}).Count(&jobs)
+	db.Model(&models.LibraryPath{}).Count(&paths)
+	if games != 0 || jobs != 0 {
+		t.Fatalf("expected games/jobs cleared, got %d/%d", games, jobs)
+	}
+	if paths != 1 {
+		t.Fatalf("expected library paths kept, got %d", paths)
 	}
 }
 

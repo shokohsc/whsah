@@ -27,7 +27,7 @@ func testDB(t *testing.T) *gorm.DB {
 		t.Fatalf("db.DB: %v", err)
 	}
 	sqlDB.SetMaxOpenConns(1)
-	if err := db.AutoMigrate(&models.Game{}, &models.GameJob{}); err != nil {
+	if err := db.AutoMigrate(&models.Game{}, &models.GameJob{}, &models.LibraryPath{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db
@@ -232,6 +232,43 @@ func TestProcessLibrary(t *testing.T) {
 	}
 	if len(jobs) != 4 {
 		t.Fatalf("expected 4 jobs, got %d", len(jobs))
+	}
+}
+
+func TestProcessLibraryCategories(t *testing.T) {
+	db := testDB(t)
+	repacks := t.TempDir()
+	isos := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repacks, "Packed Game"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(isos, "Disc Game"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	db.Create(&models.LibraryPath{Category: models.CategoryRepacks, Path: repacks})
+	db.Create(&models.LibraryPath{Category: models.CategoryISOs, Path: isos})
+
+	svc := New(db, nil, time.Millisecond)
+	if _, err := Enqueue(db, models.LibraryJobGameID, models.JobKindLibrary, nil); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := svc.tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	want := map[string]models.LibraryCategory{
+		"Packed Game": models.CategoryRepacks,
+		"Disc Game":   models.CategoryISOs,
+	}
+	var games []models.Game
+	db.Find(&games)
+	if len(games) != len(want) {
+		t.Fatalf("expected %d games, got %d", len(want), len(games))
+	}
+	for _, g := range games {
+		if g.Category != want[g.Title] {
+			t.Fatalf("game %q category = %q, want %q", g.Title, g.Category, want[g.Title])
+		}
 	}
 }
 

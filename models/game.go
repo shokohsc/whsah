@@ -15,14 +15,15 @@ type VMConfig struct {
 
 // Game is a playable game with its metadata and default VM configuration.
 type Game struct {
-	ID          uint           `gorm:"primaryKey" json:"id"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
-	DeletedAt   gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
+	ID        uint           `gorm:"primaryKey" json:"id"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"deleted_at,omitempty"`
 
-	Title       string    `gorm:"not null" json:"title"`
-	Metadata    string    `gorm:"not null" json:"metadata"` // JSON-serialized game metadata
-	LibraryPath string    `gorm:"not null" json:"library_path"` // SMB share path mounted in the VM
+	Title       string          `gorm:"not null" json:"title"`
+	Metadata    string          `gorm:"not null" json:"metadata"`            // JSON-serialized game metadata
+	LibraryPath string          `gorm:"not null" json:"library_path"`        // SMB share path mounted in the VM
+	Category    LibraryCategory `gorm:"not null;default:''" json:"category"` // library category the game came from
 
 	VMConfig VMConfig `gorm:"embedded" json:"vm_config"` // cpu cores, ram size, disk size
 

@@ -83,12 +83,42 @@
       <!-- Admin: create games and start the worker queue -->
       <div v-if="can.manageGames" class="box mt-4" :class="themeClass">
         <h2 class="subtitle">Games (admin)</h2>
+
+        <label class="label">Library paths</label>
+        <div v-for="p in libraryPaths" :key="p.id" class="field is-grouped">
+          <div class="control">
+            <span class="tag is-info">{{ p.category }}</span>
+          </div>
+          <div class="control is-expanded">{{ p.path }}</div>
+          <div class="control">
+            <button class="button is-small is-danger" @click="removeLibraryPath(p)">Remove</button>
+          </div>
+        </div>
+        <div class="field is-grouped">
+          <div class="control">
+            <div class="select">
+              <select v-model="newPath.category">
+                <option v-for="c in categories" :key="c" :value="c">{{ c }}</option>
+              </select>
+            </div>
+          </div>
+          <div class="control is-expanded">
+            <input class="input" v-model="newPath.path" placeholder="/games/repacks" />
+          </div>
+          <div class="control">
+            <button class="button is-small is-primary" @click="addLibraryPath">Add path</button>
+          </div>
+        </div>
+
         <div class="field is-grouped">
           <div class="control">
             <button class="button is-info" @click="processLibrary">Process library</button>
           </div>
+          <div class="control">
+            <button class="button is-danger" @click="resetLibrary">Reset library</button>
+          </div>
           <div class="control is-expanded">
-            <p class="help">Starts the workers: they scan the library and process every game they find.</p>
+            <p class="help">Starts the workers: they scan every configured path and process the game folders they find. Reset deletes all games and jobs so the library can be rebuilt from scratch.</p>
           </div>
         </div>
         <div class="field is-grouped">
@@ -109,6 +139,7 @@
           <thead>
             <tr>
               <th>Title</th>
+              <th>Category</th>
               <th>Library path</th>
               <th>PEGI</th>
               <th>Worker jobs</th>
@@ -117,6 +148,7 @@
           <tbody>
             <tr v-for="g in allGames" :key="g.id">
               <td>{{ g.title }}</td>
+              <td>{{ g.category || "—" }}</td>
               <td>
                 <div class="field is-grouped">
                   <div class="control is-expanded">
@@ -174,6 +206,7 @@
         <thead>
           <tr>
             <th>Title</th>
+            <th>Category</th>
             <th>PEGI</th>
             <th>CPU</th>
             <th>RAM</th>
@@ -184,6 +217,7 @@
         <tbody>
           <tr v-for="g in visibleGames" :key="g.id">
             <td>{{ g.title }}</td>
+            <td>{{ g.category || "—" }}</td>
             <td>{{ g.pegi_rating }}</td>
             <td>{{ g.vm_config.cpu_cores }}</td>
             <td>{{ g.vm_config.ram_size }} MB</td>
@@ -217,6 +251,9 @@ const user = ref(null)
 const showOverride = ref(false)
 const override = ref({ id: null, cpu_cores: 2, ram_size: 4096, disk_size: 128 })
 const libraryEdits = ref({})
+const libraryPaths = ref([])
+const categories = ["repacks", "portables", "isos", "setups"]
+const newPath = ref({ category: "repacks", path: "" })
 const users = ref([])
 const newGame = ref({ title: "", pegi_rating: "", library_path: "" })
 
@@ -282,7 +319,10 @@ async function load() {
   if (!localStorage.getItem("token")) return
   try {
     user.value = await api("/me")
-    if (user.value.role === "admin") users.value = await api("/users")
+    if (user.value.role === "admin") {
+      users.value = await api("/users")
+      libraryPaths.value = await api("/library/paths")
+    }
   } catch {
     localStorage.removeItem("token")
     user.value = null
@@ -363,6 +403,48 @@ async function processLibrary() {
   try {
     const job = await api("/library/jobs", { method: "POST" })
     msg.value = "Library job #" + job.id + " queued: the workers process the games in the library"
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function addLibraryPath() {
+  error.value = ""
+  msg.value = ""
+  try {
+    await api("/library/paths", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newPath.value),
+    })
+    newPath.value.path = ""
+    msg.value = "Library path added"
+    libraryPaths.value = await api("/library/paths")
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function removeLibraryPath(p) {
+  error.value = ""
+  msg.value = ""
+  try {
+    await api("/library/paths/" + p.id, { method: "DELETE" })
+    msg.value = "Library path removed"
+    libraryPaths.value = await api("/library/paths")
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function resetLibrary() {
+  error.value = ""
+  msg.value = ""
+  if (!confirm("Delete all games and queued jobs? Configured paths are kept.")) return
+  try {
+    await api("/library", { method: "DELETE" })
+    msg.value = "Library reset"
+    await load()
   } catch (e) {
     error.value = e.message
   }

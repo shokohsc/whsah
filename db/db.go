@@ -23,5 +23,6 @@ func Migrate(db *gorm.DB) error {
 		&models.Game{},
 		&models.Session{},
 		&models.GameJob{},
+		&models.LibraryPath{},
 	)
 }
