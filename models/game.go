@@ -29,3 +29,12 @@ type Game struct {
 
 	PEGIRating string `gorm:"not null" json:"pegi_rating"`
 }
+
+// SanitizedName returns the cleaned game name used for metadata lookups.
+func (g *Game) SanitizedName() string {
+	if g == nil {
+		return ""
+	}
+	return SanitizeGameName(g.Title)
+}
+
