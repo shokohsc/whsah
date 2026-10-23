@@ -42,8 +42,13 @@ Optional with defaults:
 
 Worker env vars (`cmd/worker`):
 - `VDI_DATABASE_DSN` — PostgreSQL connection string (queue + game state; required)
-- `VDI_METADATA_URL` — HTTP metadata source for `metadata` jobs: `GET {VDI_METADATA_URL}/games?title={title}` returns the metadata JSON body (empty = metadata retrieval fails as "not configured")
 - `VDI_LIBRARY_PATH` — legacy fallback scanned by `library` jobs when no paths are configured in the UI
+- `VDI_METADATA_URL` — custom HTTP metadata source: `GET {VDI_METADATA_URL}/games?title={title}` returns a metadata JSON body (empty = disabled)
+- `VDI_RAWG_API_KEY` — rawg.io API key (empty = RAWG disabled)
+- `VDI_BROWSERLESS_URL`, `VDI_BROWSERLESS_TOKEN` — remote browserless instance for FitGirl scraping (empty URL = FitGirl disabled)
+- `VDI_FITGIRL_SEARCH_URL` — FitGirl search endpoint with a `{query}` placeholder
+- `VDI_YOUTUBE_API_KEY` — YouTube Data API key for live streams and video replays
+- Steam and PCGamingWiki are always enabled (public APIs)
 
 Agent env vars:
 - `VDI_SERVER_URL`, `VDI_VM_ID`, `VDI_GAME_LIB`, `VDI_SMB_SHARE`, `VDI_SMB_CREDS`, `VDI_IDLE_SECS` (default 1800s), `VDI_AGENT_TOKEN`, `VDI_LOKI_URL`
@@ -67,6 +72,7 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 - `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown, Loki logging, VM ops via server only (never direct Proxmox)
 - `internal/firewall` — ephemeral co-op pinholes with TTL
 - `internal/worker` — PostgreSQL-backed job queue: atomically claims pending game jobs (config generation, metadata retrieval, library scan) and writes results back to `Game`
+- `internal/metadata` — metadata providers (custom HTTP, RAWG, Steam, PCGamingWiki, FitGirl via browserless, YouTube) and the aggregator that cross-references/merges them; `metadata` jobs write the merged JSON to `Game.metadata` and the PEGI (or ESRB-derived PEGI) to `Game.pegi_rating`
 
 ## Gotchas
 - `server` binary at repo root is a build artifact; gitignored along with `web/node_modules` and `web/dist`.

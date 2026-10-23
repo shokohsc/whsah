@@ -76,9 +76,21 @@ type Config struct {
 	// LibraryPath is the default game library mount path used by the agent.
 	LibraryPath string
 
-	// MetadataURL is the HTTP metadata source used by game metadata jobs
-	// (empty = metadata retrieval disabled).
+	// MetadataURL is the custom HTTP metadata source used by game metadata
+	// jobs (empty = custom source disabled).
 	MetadataURL string
+	// RAWGAPIKey enables the RAWG metadata provider.
+	RAWGAPIKey string
+	// BrowserlessURL is the browserless instance used to scrape FitGirl
+	// (empty = FitGirl scraping disabled).
+	BrowserlessURL string
+	// BrowserlessToken authenticates to the browserless instance.
+	BrowserlessToken string
+	// FitGirlSearchURL is the FitGirl search endpoint; {query} is replaced
+	// with the URL-escaped game title.
+	FitGirlSearchURL string
+	// YouTubeAPIKey enables the YouTube provider for live streams and replays.
+	YouTubeAPIKey string
 
 	// LokiURL is the remote Loki endpoint for agent logs (empty = disabled).
 	LokiURL string
@@ -109,14 +121,14 @@ type Config struct {
 // Default returns a Config populated with the plan.md defaults.
 func Default() Config {
 	return Config{
-		BackupInterval:   DefaultBackupInterval,
-		VMDeletionDelay:  DefaultVMDeletionDelay,
-		ListenAddr:       ":8080",
-		IdleSecs:         DefaultIdleSecs,
-		ProxmoxAuthMode:  ProxmoxAuthToken,
-		KubernetesMode:   KubernetesModeAuto,
-		FrontendOrigin:   DefaultFrontendOrigin,
-		OIDCPublicURL:    DefaultPublicURL,
-		DefaultAge:       DefaultAge,
+		BackupInterval:  DefaultBackupInterval,
+		VMDeletionDelay: DefaultVMDeletionDelay,
+		ListenAddr:      ":8080",
+		IdleSecs:        DefaultIdleSecs,
+		ProxmoxAuthMode: ProxmoxAuthToken,
+		KubernetesMode:  KubernetesModeAuto,
+		FrontendOrigin:  DefaultFrontendOrigin,
+		OIDCPublicURL:   DefaultPublicURL,
+		DefaultAge:      DefaultAge,
 	}
 }

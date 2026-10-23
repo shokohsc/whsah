@@ -130,6 +130,30 @@ func TestProcessMetadata(t *testing.T) {
 	}
 }
 
+func TestProcessMetadataUpdatesPEGI(t *testing.T) {
+	db := testDB(t)
+	db.Create(&models.Game{Title: "Teen Game", PEGIRating: "18", LibraryPath: "/smb/teen"})
+	svc := New(db, &fakeFetcher{meta: `{"pegi_rating":"12","genres":["puzzle"]}`}, time.Millisecond)
+
+	if _, err := Enqueue(db, 1, models.JobKindMetadata, nil); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := svc.tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	var game models.Game
+	if err := db.First(&game, 1).Error; err != nil {
+		t.Fatalf("game: %v", err)
+	}
+	if game.PEGIRating != "12" {
+		t.Fatalf("expected metadata PEGI to win, got %q", game.PEGIRating)
+	}
+	if game.Metadata != `{"pegi_rating":"12","genres":["puzzle"]}` {
+		t.Fatalf("unexpected metadata: %q", game.Metadata)
+	}
+}
+
 func TestProcessMetadataFailure(t *testing.T) {
 	db := testDB(t)
 	db.Create(&models.Game{Title: "Kids Game", PEGIRating: "3", LibraryPath: "/smb/kids"})

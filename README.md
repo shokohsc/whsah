@@ -25,6 +25,7 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 - `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown, Loki logging, VM ops via server only (never direct Proxmox)
 - `internal/firewall` — ephemeral co-op pinholes with TTL
 - `internal/worker` — PostgreSQL-backed job queue: claims pending game jobs (config generation, metadata retrieval, library scan) and writes results back to `Game`
+- `internal/metadata` — remote metadata providers (RAWG, Steam, PCGamingWiki, FitGirl through browserless, YouTube, custom HTTP) and the aggregator that cross-references and merges them
 
 ## Quickstart
 
@@ -67,8 +68,14 @@ Agent env vars:
 
 Worker env vars (`cmd/worker`):
 - `VDI_DATABASE_DSN` — PostgreSQL connection string (queue + game state; required)
-- `VDI_METADATA_URL` — HTTP metadata source for `metadata` jobs: `GET {VDI_METADATA_URL}/games?title={title}` returns the metadata JSON body (empty = metadata retrieval fails as "not configured")
 - `VDI_LIBRARY_PATH` — legacy fallback directory scanned by `library` jobs when no paths are configured in the UI (DB-configured paths take precedence)
+- `VDI_METADATA_URL` — custom HTTP metadata source: `GET {VDI_METADATA_URL}/games?title={title}` returns a metadata JSON body (empty = disabled; checked first)
+- `VDI_RAWG_API_KEY` — rawg.io API key (empty = RAWG disabled)
+- `VDI_BROWSERLESS_URL`, `VDI_BROWSERLESS_TOKEN` — remote browserless instance used to scrape FitGirl (empty URL = FitGirl disabled)
+- `VDI_FITGIRL_SEARCH_URL` — FitGirl search endpoint; `{query}` is replaced with the URL-escaped title (default `https://fitgirl-repacks.site/?s={query}`)
+- `VDI_YOUTUBE_API_KEY` — YouTube Data API key used for live streams and video replays (empty = YouTube disabled)
+
+Steam and PCGamingWiki are queried by default; they need no credentials.
 
 Build, run, frontend:
 
@@ -167,8 +174,23 @@ Games are configured and enriched asynchronously through a PostgreSQL-backed que
 1. An admin enqueues a job: `POST /games/{id}/jobs` with `kind` = `config` or `metadata` (and an optional `payload`).
 2. One or more `cmd/worker` processes claim pending jobs atomically (`status: pending` → `processing`) directly from PostgreSQL, so workers can be scaled horizontally.
 3. `config` jobs generate the game's `VMConfig` — from the job `payload` when provided, otherwise derived from the PEGI rating — and write it back to the `Game` row.
-4. `metadata` jobs retrieve metadata from `VDI_METADATA_URL` (`GET {VDI_METADATA_URL}/games?title={title}`) and write it to `Game.metadata`.
+4. `metadata` jobs query every configured metadata provider in priority order, cross-reference the results (first non-empty value wins, lists and sources are merged) and write the merged JSON to `Game.metadata`. A PEGI rating from the metadata also updates `Game.pegi_rating`; when a source only carries ESRB, its PEGI equivalent is used.
 5. Results land in `GameJob.result`, failures in `GameJob.error`; clients poll `GET /jobs/{id}`.
+
+### Metadata sources
+
+The worker merges these sources in order (custom HTTP first, then RAWG, Steam, PCGamingWiki, FitGirl, YouTube). A failing source does not fail the job as long as another source succeeds; every stored record lists its `sources` with URLs.
+
+| Source | Enabled by | Fields |
+| --- | --- | --- |
+| Custom HTTP | `VDI_METADATA_URL` | already-aggregated metadata JSON |
+| RAWG | `VDI_RAWG_API_KEY` | rating, genres, tags, release date, platforms, Metacritic, developer, publisher, ESRB, video replays |
+| Steam | always (public API) | genres, release date, platforms, Metacritic, PC specs, developer, publisher, PEGI/ESRB, video replays, reviews |
+| PCGamingWiki | always (public API) | genres, tags, release date, platforms, Metacritic, PC specs, developer, publisher, PEGI/ESRB |
+| FitGirl | `VDI_BROWSERLESS_URL` | genres/tags, developer, PC specs, PEGI/ESRB |
+| YouTube | `VDI_YOUTUBE_API_KEY` | live streams, video replays |
+
+Sites from `plan.md` that have no public API or require credentials/anti-bot handling (VGDB, IGDB, NexusMods, Kick, IGG-Games, Kaos, Dodi, Online-Fix, SensCritique, Kotaku) can be plugged in as additional `metadata.Provider` implementations; use the FitGirl browserless provider as the reference for rendered pages.
 
 ### Processing the library
 

@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 
 	"selfhosted-gaming-vdi/internal/logging"
+	"selfhosted-gaming-vdi/internal/metadata"
 	"selfhosted-gaming-vdi/models"
 )
 
@@ -254,7 +255,12 @@ func (s *Service) applyMetadata(ctx context.Context, game *models.Game) (string,
 		return "", err
 	}
 	s.logger.Debug("metadata fetched", "game_id", game.ID, "bytes", len(meta))
-	if err := s.db.WithContext(ctx).Model(&models.Game{}).Where("id = ?", game.ID).Update("metadata", meta).Error; err != nil {
+	updates := map[string]any{"metadata": meta}
+	var parsed metadata.Metadata
+	if err := json.Unmarshal([]byte(meta), &parsed); err == nil && parsed.PEGIRating != "" {
+		updates["pegi_rating"] = parsed.PEGIRating
+	}
+	if err := s.db.WithContext(ctx).Model(&models.Game{}).Where("id = ?", game.ID).Updates(updates).Error; err != nil {
 		return "", err
 	}
 	return meta, nil
