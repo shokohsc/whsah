@@ -9,6 +9,7 @@ import (
 	"selfhosted-gaming-vdi/config"
 	"selfhosted-gaming-vdi/db"
 	"selfhosted-gaming-vdi/internal/logging"
+	"selfhosted-gaming-vdi/internal/metadata"
 	"selfhosted-gaming-vdi/internal/worker"
 )
 
@@ -27,6 +28,21 @@ func main() {
 	if v := os.Getenv("VDI_LIBRARY_PATH"); v != "" {
 		cfg.LibraryPath = v
 	}
+	if v := os.Getenv("VDI_RAWG_API_KEY"); v != "" {
+		cfg.RAWGAPIKey = v
+	}
+	if v := os.Getenv("VDI_BROWSERLESS_URL"); v != "" {
+		cfg.BrowserlessURL = v
+	}
+	if v := os.Getenv("VDI_BROWSERLESS_TOKEN"); v != "" {
+		cfg.BrowserlessToken = v
+	}
+	if v := os.Getenv("VDI_FITGIRL_SEARCH_URL"); v != "" {
+		cfg.FitGirlSearchURL = v
+	}
+	if v := os.Getenv("VDI_YOUTUBE_API_KEY"); v != "" {
+		cfg.YouTubeAPIKey = v
+	}
 
 	gormDB, err := db.Open(cfg)
 	if err != nil {
@@ -38,7 +54,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	svc := worker.New(gormDB, &worker.HTTPFetcher{BaseURL: cfg.MetadataURL}, worker.DefaultPollInterval).WithLogger(logger).WithLibraryPath(cfg.LibraryPath)
+	fetcher := metadata.New(metadata.BuildProviders(metadata.Config{
+		CustomURL:        cfg.MetadataURL,
+		RAWGAPIKey:       cfg.RAWGAPIKey,
+		BrowserlessURL:   cfg.BrowserlessURL,
+		BrowserlessToken: cfg.BrowserlessToken,
+		FitGirlSearchURL: cfg.FitGirlSearchURL,
+		YouTubeAPIKey:    cfg.YouTubeAPIKey,
+	})...)
+	fetcher.Logger = logger
+
+	svc := worker.New(gormDB, fetcher, worker.DefaultPollInterval).WithLogger(logger).WithLibraryPath(cfg.LibraryPath)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

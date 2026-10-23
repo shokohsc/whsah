@@ -7,13 +7,33 @@ metadata:
     component: worker
 data:
   VDI_DATABASE_DSN: "postgres://vdi:vdi@postgres:5432/vdi?sslmode=disable"
-  # VDI_METADATA_URL — HTTP metadata source for `metadata` jobs:
+  # VDI_METADATA_URL — custom HTTP metadata source:
   #   GET {VDI_METADATA_URL}/games?title={title} returns the metadata JSON body.
-  # Leave empty to fail metadata jobs as "not configured".
   VDI_METADATA_URL: ""
+  # VDI_BROWSERLESS_URL — remote browserless instance used to scrape FitGirl
+  # (empty = FitGirl disabled). Its token lives in vdi-worker-secrets.
+  VDI_BROWSERLESS_URL: ""
+  # VDI_FITGIRL_SEARCH_URL — optional search endpoint override; {query} is
+  # replaced with the URL-escaped title.
+  VDI_FITGIRL_SEARCH_URL: ""
   # VDI_LIBRARY_PATH — directory holding the game files. `library` jobs scan
   # it, so the library must be mounted into the worker at this path.
   VDI_LIBRARY_PATH: "/mnt/games"
+---
+# API keys and browserless tokens. Replace the empty values or leave them
+# empty to disable the corresponding provider.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vdi-worker-secrets
+  labels:
+    app: vdi
+    component: worker
+type: Opaque
+stringData:
+  VDI_RAWG_API_KEY: ""
+  VDI_BROWSERLESS_TOKEN: ""
+  VDI_YOUTUBE_API_KEY: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -55,6 +75,31 @@ spec:
                 configMapKeyRef:
                   name: vdi-worker-config
                   key: VDI_LIBRARY_PATH
+            - name: VDI_RAWG_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-worker-secrets
+                  key: VDI_RAWG_API_KEY
+            - name: VDI_BROWSERLESS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-worker-config
+                  key: VDI_BROWSERLESS_URL
+            - name: VDI_BROWSERLESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-worker-secrets
+                  key: VDI_BROWSERLESS_TOKEN
+            - name: VDI_FITGIRL_SEARCH_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-worker-config
+                  key: VDI_FITGIRL_SEARCH_URL
+            - name: VDI_YOUTUBE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-worker-secrets
+                  key: VDI_YOUTUBE_API_KEY
           resources:
             requests:
               cpu: 50m
