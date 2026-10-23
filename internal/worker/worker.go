@@ -249,7 +249,11 @@ func (s *Service) applyConfig(ctx context.Context, game *models.Game, job *model
 
 // applyMetadata retrieves the game's metadata and persists it to the game row.
 func (s *Service) applyMetadata(ctx context.Context, game *models.Game) (string, error) {
-	meta, err := s.fetcher.FetchMetadata(ctx, game.Title)
+	query := game.SanitizedName()
+	if query == "" {
+		query = game.Title
+	}
+	meta, err := s.fetcher.FetchMetadata(ctx, query)
 	if err != nil {
 		s.logger.Warn("metadata fetch failed", "game_id", game.ID, "err", logging.SafeError(err))
 		return "", err
@@ -265,6 +269,7 @@ func (s *Service) applyMetadata(ctx context.Context, game *models.Game) (string,
 	}
 	return meta, nil
 }
+
 
 // defaultPEGIRating is the rating a game discovered in the library gets until
 // an admin sets the real one: the strictest rating keeps it out of reach.
