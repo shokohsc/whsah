@@ -1,3 +1,10 @@
 web/node_modules
 web/dist
-./server
+/server
+/worker
+/agent
+/dist/
+*.exe
+.env
+.env.*
+.DS_Store

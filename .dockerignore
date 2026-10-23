@@ -1,0 +1,38 @@
+# Binaries
+bin/
+*.exe
+*.test
+*.out
+
+# Go
+vendor/
+coverage.out
+coverage.html
+
+# Build artifacts
+/dist/
+/server
+/worker
+/agent
+
+# Logs
+*.log
+
+# Editor/OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Git
+.git
+
+# Node
+web/node_modules
+web/dist
