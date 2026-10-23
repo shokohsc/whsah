@@ -9,6 +9,7 @@ import (
 var (
 	archiveExtRE   = regexp.MustCompile(`(?i)\.(zip|rar|7z|tar\.gz|iso|bin|cue|tgz)$`)
 	bracketsRE     = regexp.MustCompile(`[\[(][^\])]*[\])]`)
+	repackRE       = regexp.MustCompile(`\.[ReEpPaAcCkK]+- ?[A-Za-z0-9]+$`)
 	sceneTagRE     = regexp.MustCompile(`- ?[A-Za-z0-9]+$`)
 	versionRE      = regexp.MustCompile(`(?i)\bv?\d+(\.\d+)*\b`)
 	revisionRE     = regexp.MustCompile(`(?i)\bRev(ision)?\s*[A-Z0-9]+\b`)
