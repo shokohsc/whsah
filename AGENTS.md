@@ -43,7 +43,7 @@ Optional with defaults:
 Worker env vars (`cmd/worker`):
 - `VDI_DATABASE_DSN` — PostgreSQL connection string (queue + game state; required)
 - `VDI_METADATA_URL` — HTTP metadata source for `metadata` jobs: `GET {VDI_METADATA_URL}/games?title={title}` returns the metadata JSON body (empty = metadata retrieval fails as "not configured")
-- `VDI_LIBRARY_PATH` — directory holding the game files; `library` jobs scan it (empty = library jobs fail as "not configured")
+- `VDI_LIBRARY_PATH` — legacy fallback scanned by `library` jobs when no paths are configured in the UI
 
 Agent env vars:
 - `VDI_SERVER_URL`, `VDI_VM_ID`, `VDI_GAME_LIB`, `VDI_SMB_SHARE`, `VDI_SMB_CREDS`, `VDI_IDLE_SECS` (default 1800s), `VDI_AGENT_TOKEN`, `VDI_LOKI_URL`
@@ -52,13 +52,14 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 
 ## Data model (single source of truth)
 - `models/user.go`: `User` — roles `anonymous` / `gamer` / `admin`
-- `models/game.go`: `Game` — title, metadata JSON, `library_path`, embedded `VMConfig` (`cpu_cores`, `ram_size` MB, `disk_size` GB), `pegi_rating`
+- `models/game.go`: `Game` — title, metadata JSON, `library_path`, `category` (`repacks` / `portables` / `isos` / `setups`), embedded `VMConfig` (`cpu_cores`, `ram_size` MB, `disk_size` GB), `pegi_rating`
+- `models/library.go`: `LibraryPath` — admin-configured game directory: `category` + `path`
 - `models/session.go`: `Session` — user/game/vm, `backups`, `last_user_session` (drives deletion delay), per-session VM config overrides
 - `models/gamejob.go`: `GameJob` — queued work on a game: `kind` (`config` / `metadata` / `library`), `status` (`pending` / `processing` / `done` / `failed`), `payload`, `result`, `error`, `attempts`. The queue lives in PostgreSQL, so any number of workers can share it. Library-wide jobs are not bound to a game and use `models.LibraryJobGameID` (0).
-- All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migrate` (GORM AutoMigrate)
+- All tables get `created_at`/`updated_at` (soft-deletable tables also `deleted_at`); migrations via `db.Migrate` (GORM AutoMigrate)
 
 ## Architecture boundaries
-- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), provider discovery (`/.well-known/openid-configuration`), JWT verification (JWKS), first-login provisioning + admin promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/library/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
+- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), provider discovery (`/.well-known/openid-configuration`), JWT verification (JWKS), first-login provisioning + admin promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/library/jobs`, `/library/paths`, `DELETE /library`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
 - `deploy/k8s/gateway.yaml` — Gateway API ListenerSet + HTTPRoute exposing the API at `api.domain.tld`; the frontend routes between the app and `/login` via a hash router (`web/src/main.js`)
 - `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
 - `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
@@ -73,5 +74,5 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 - The OIDC provider must serve a discovery document at `{VDI_OIDC_ISSUER}/.well-known/openid-configuration`; endpoints are never hardcoded (Pocket ID uses `/authorize` + `/api/oidc/token`, Keycloak `/protocol/openid-connect/*`).
 - Frontend build output goes to `web/dist`; do not commit it.
 - Agent–VM interaction on the Proxmox side goes through the server (`/agent/vm/*`); agents must not call Proxmox directly.
-- The library scan runs in the worker, so the worker needs the game files mounted at `VDI_LIBRARY_PATH`.
+- The library scan runs in the worker, so the worker needs every configured library path mounted; `VDI_LIBRARY_PATH` is only a fallback when no paths are configured in the UI.
 - When running the server in Kubernetes with `VDI_KUBERNETES_MODE=incluster`, the pod's ServiceAccount needs RBAC to list/patch Talos nodes.

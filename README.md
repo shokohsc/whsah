@@ -18,7 +18,7 @@ Self-hosted VDI service oriented toward gaming VMs. Private/internal only; not e
 
 ## Architecture boundaries
 
-- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), JWT verification (JWKS), first-login user provisioning and admin-subject promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/library/jobs`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
+- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), JWT verification (JWKS), first-login user provisioning and admin-subject promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/library/jobs`, `/library/paths`, `DELETE /library`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating, agent token auth
 - `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
 - `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
 - `internal/backup` — periodic backup tick + VM deletion after `last_user_session + delay`
@@ -68,7 +68,7 @@ Agent env vars:
 Worker env vars (`cmd/worker`):
 - `VDI_DATABASE_DSN` — PostgreSQL connection string (queue + game state; required)
 - `VDI_METADATA_URL` — HTTP metadata source for `metadata` jobs: `GET {VDI_METADATA_URL}/games?title={title}` returns the metadata JSON body (empty = metadata retrieval fails as "not configured")
-- `VDI_LIBRARY_PATH` — directory holding the game files; `library` jobs scan it (empty = library jobs fail as "not configured")
+- `VDI_LIBRARY_PATH` — legacy fallback directory scanned by `library` jobs when no paths are configured in the UI (DB-configured paths take precedence)
 
 Build, run, frontend:
 
@@ -131,11 +131,12 @@ kubectl create secret generic vdi-agent \
 ## Data model
 
 - `User` — roles `anonymous` / `gamer` / `admin`
-- `Game` — title, metadata JSON, `library_path`, embedded `VMConfig` (`cpu_cores`, `ram_size` MB, `disk_size` GB), `pegi_rating`
+- `Game` — title, metadata JSON, `library_path`, `category` (`repacks` / `portables` / `isos` / `setups`), embedded `VMConfig` (`cpu_cores`, `ram_size` MB, `disk_size` GB), `pegi_rating`
+- `LibraryPath` — admin-configured game directory: `category` + `path`
 - `Session` — user/game/vm, `backups`, `last_user_session`, per-session VM config overrides
 - `GameJob` — queued work on a game: `kind` (`config` / `metadata` / `library`), `status` (`pending` / `processing` / `done` / `failed`), `payload`, `result`, `error`, `attempts`. The queue lives in PostgreSQL, so any number of workers can share it.
 
-All tables get `created_at`, `updated_at`, `deleted_at`; migrations via `db.Migrate` (GORM AutoMigrate).
+All tables get `created_at` and `updated_at` (soft-deletable tables also `deleted_at`); migrations via `db.Migrate` (GORM AutoMigrate).
 
 ## API endpoints
 
@@ -146,6 +147,9 @@ The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yam
 - `PUT /users/{id}` (admin) — change a user's `role` (`anonymous` / `gamer` / `admin`)
 - `POST /games/{id}/jobs` (admin) — enqueue a game job (`kind`: `config` or `metadata`, optional `payload`); returns `202` with the queued job
 - `POST /library/jobs` (admin) — start the workers on the game files in the library; returns `202` with the queued `library` job
+- `GET/POST /library/paths` (admin) — list/add game directories, each categorized as `repacks`, `portables`, `isos` or `setups`
+- `DELETE /library/paths/{id}` (admin) — remove a configured game directory
+- `DELETE /library` (admin) — reset the library: delete all games and queued jobs, keeping the configured paths
 - `GET /games/{id}/jobs` (admin) — list a game's jobs
 - `GET /jobs/{id}` — poll a job's `status`, `result`, `error`
 - `GET /me` — current user id/username/role/age
@@ -168,9 +172,11 @@ Games are configured and enriched asynchronously through a PostgreSQL-backed que
 
 ### Processing the library
 
-An admin starts the workers on the game files in the library with `POST /library/jobs`. The queued `library` job is claimed by a worker, which scans `VDI_LIBRARY_PATH`: every directory in it is a game, registered with the library path as its `library_path` and queued for a `config` and a `metadata` job. A game an admin already created keeps its PEGI rating, only its library path is refreshed. Games found in the library get the strictest PEGI rating (`18`) until an admin sets the real one.
+Admins configure game directories in the UI (`GET/POST /library/paths`), each categorized as `repacks`, `portables`, `isos` or `setups`. An admin then starts the workers with `POST /library/jobs`. The queued `library` job is claimed by a worker, which scans every configured path: every directory in it is a game, registered with the directory as its `library_path`, the path's category as its `category`, and queued for a `config` and a `metadata` job. A game an admin already created keeps its PEGI rating, only its library path and category are refreshed. Games found in the library get the strictest PEGI rating (`18`) until an admin sets the real one.
 
-The worker needs the library mounted at `VDI_LIBRARY_PATH` (mount the share or a PVC with the game files into the worker pod).
+When no paths are configured, `library` jobs fall back to `VDI_LIBRARY_PATH`. The worker needs every configured library mounted (mount the shares or PVCs with the game files into the worker pod).
+
+`DELETE /library` (the Reset library button) deletes all games and queued jobs so the admin can rebuild the library from scratch; the configured paths are kept.
 
 ## Security model
 

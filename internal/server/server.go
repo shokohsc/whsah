@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -54,6 +55,10 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /games/{id}/jobs", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleEnqueueGameJob))))
 	mux.Handle("GET /games/{id}/jobs", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListGameJobs))))
 	mux.Handle("POST /library/jobs", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleEnqueueLibraryJob))))
+	mux.Handle("DELETE /library", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleResetLibrary))))
+	mux.Handle("GET /library/paths", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListLibraryPaths))))
+	mux.Handle("POST /library/paths", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateLibraryPath))))
+	mux.Handle("DELETE /library/paths/{id}", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleDeleteLibraryPath))))
 	mux.Handle("GET /jobs/{id}", s.auth(http.HandlerFunc(s.handleGetJob)))
 	mux.Handle("GET /sessions", s.auth(http.HandlerFunc(s.handleListSessions)))
 	mux.Handle("POST /sessions", s.auth(http.HandlerFunc(s.handleCreateSession)))
@@ -331,16 +336,17 @@ func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type gameOut struct {
-		ID          uint           `json:"id"`
-		Title       string         `json:"title"`
-		LibraryPath string         `json:"library_path"`
-		PEGIRating  string         `json:"pegi_rating"`
-		VMConfig    models.VMConfig `json:"vm_config"`
-		Metadata    string         `json:"metadata"`
+		ID          uint                   `json:"id"`
+		Title       string                 `json:"title"`
+		LibraryPath string                 `json:"library_path"`
+		Category    models.LibraryCategory `json:"category"`
+		PEGIRating  string                 `json:"pegi_rating"`
+		VMConfig    models.VMConfig        `json:"vm_config"`
+		Metadata    string                 `json:"metadata"`
 	}
 	out := make([]gameOut, len(games))
 	for i, g := range games {
-		out[i] = gameOut{ID: g.ID, Title: g.Title, LibraryPath: g.LibraryPath, PEGIRating: g.PEGIRating, VMConfig: g.VMConfig, Metadata: g.Metadata}
+		out[i] = gameOut{ID: g.ID, Title: g.Title, LibraryPath: g.LibraryPath, Category: g.Category, PEGIRating: g.PEGIRating, VMConfig: g.VMConfig, Metadata: g.Metadata}
 	}
 	s.writeJSON(w, http.StatusOK, out)
 }
@@ -443,6 +449,102 @@ func (s *Server) handleEnqueueLibraryJob(w http.ResponseWriter, r *http.Request)
 	s.writeJSON(w, http.StatusAccepted, job)
 }
 
+// handleListLibraryPaths returns the admin-configured library paths.
+func (s *Server) handleListLibraryPaths(w http.ResponseWriter, r *http.Request) {
+	var paths []models.LibraryPath
+	if err := s.db.Order("id").Find(&paths).Error; err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, paths)
+}
+
+// handleCreateLibraryPath adds a directory holding games, categorized as
+// repacks, portables, isos or setups.
+func (s *Server) handleCreateLibraryPath(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Category models.LibraryCategory `json:"category"`
+		Path     string                 `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
+	if !models.ValidLibraryCategory(req.Category) {
+		http.Error(w, `{"error":"invalid category"}`, http.StatusBadRequest)
+		return
+	}
+	req.Path = filepath.Clean(strings.TrimSpace(req.Path))
+	if req.Path == "" || req.Path == "." {
+		http.Error(w, `{"error":"path required"}`, http.StatusBadRequest)
+		return
+	}
+	var existing models.LibraryPath
+	err := s.db.Where("category = ? AND path = ?", req.Category, req.Path).First(&existing).Error
+	if err == nil {
+		http.Error(w, `{"error":"library path already configured"}`, http.StatusConflict)
+		return
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	lib := models.LibraryPath{Category: req.Category, Path: req.Path}
+	if err := s.db.Create(&lib).Error; err != nil {
+		s.logger.Error("library path create failed", "category", req.Category, "path", req.Path, "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("library path created", "library_path_id", lib.ID, "category", lib.Category, "path", lib.Path)
+	s.writeJSON(w, http.StatusCreated, lib)
+}
+
+func (s *Server) handleDeleteLibraryPath(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+	result := s.db.Delete(&models.LibraryPath{}, id)
+	if result.Error != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	if result.RowsAffected == 0 {
+		http.Error(w, `{"error":"library path not found"}`, http.StatusNotFound)
+		return
+	}
+	s.logger.Info("library path deleted", "library_path_id", id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleResetLibrary deletes all games and queued jobs so the admin can
+// rescan the configured library paths from scratch. The path configuration is
+// kept.
+func (s *Server) handleResetLibrary(w http.ResponseWriter, r *http.Request) {
+	var games, jobs int64
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		jobRes := tx.Unscoped().Where("1 = 1").Delete(&models.GameJob{})
+		if jobRes.Error != nil {
+			return jobRes.Error
+		}
+		jobs = jobRes.RowsAffected
+		gameRes := tx.Unscoped().Where("1 = 1").Delete(&models.Game{})
+		if gameRes.Error != nil {
+			return gameRes.Error
+		}
+		games = gameRes.RowsAffected
+		return nil
+	})
+	if err != nil {
+		s.logger.Error("library reset failed", "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("library reset", "games", games, "jobs", jobs)
+	s.writeJSON(w, http.StatusOK, map[string]int64{"games": games, "jobs": jobs})
+}
+
 func (s *Server) handleListGameJobs(w http.ResponseWriter, r *http.Request) {
 	id, err := gameIDFromPath(r)
 	if err != nil {
@@ -504,11 +606,11 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		GameID        uint  `json:"game_id"`
-		VMID          string `json:"vm_id"`
-		OverrideCPUCores *int `json:"cpu_cores"`
-		OverrideRAMSize   *int `json:"ram_size"`
-		OverrideDiskSize  *int `json:"disk_size"`
+		GameID           uint   `json:"game_id"`
+		VMID             string `json:"vm_id"`
+		OverrideCPUCores *int   `json:"cpu_cores"`
+		OverrideRAMSize  *int   `json:"ram_size"`
+		OverrideDiskSize *int   `json:"disk_size"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
@@ -530,14 +632,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	sess := models.Session{
-		UserID:            u.ID,
-		GameID:            g.ID,
-		VMID:              req.VMID,
-		Backups:           0,
-		LastUserSession:   &now,
-		OverrideCPUCores:  req.OverrideCPUCores,
-		OverrideRAMSize:   req.OverrideRAMSize,
-		OverrideDiskSize:  req.OverrideDiskSize,
+		UserID:           u.ID,
+		GameID:           g.ID,
+		VMID:             req.VMID,
+		Backups:          0,
+		LastUserSession:  &now,
+		OverrideCPUCores: req.OverrideCPUCores,
+		OverrideRAMSize:  req.OverrideRAMSize,
+		OverrideDiskSize: req.OverrideDiskSize,
 	}
 	if err := s.db.Create(&sess).Error; err != nil {
 		s.logger.Error("session create failed", "user_id", u.ID, "game_id", g.ID, "err", err)

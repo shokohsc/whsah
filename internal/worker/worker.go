@@ -266,63 +266,83 @@ const defaultPEGIRating = "18"
 
 // libraryResult summarizes a library scan.
 type libraryResult struct {
-	LibraryPath string `json:"library_path"`
-	Games       int    `json:"games"`
-	Created     int    `json:"created"`
-	Updated     int    `json:"updated"`
-	Jobs        int    `json:"jobs"`
+	Paths   int `json:"paths"`
+	Games   int `json:"games"`
+	Created int `json:"created"`
+	Updated int `json:"updated"`
+	Jobs    int `json:"jobs"`
 }
 
-// applyLibrary processes the game files in the library: every directory is a
-// game, which is registered and queued for a config and a metadata job.
+// libraryPaths returns the admin-configured library paths, falling back to
+// the legacy VDI_LIBRARY_PATH when none are configured.
+func (s *Service) libraryPaths(ctx context.Context) ([]models.LibraryPath, error) {
+	var paths []models.LibraryPath
+	if err := s.db.WithContext(ctx).Order("id").Find(&paths).Error; err != nil {
+		return nil, err
+	}
+	if len(paths) == 0 && s.libraryPath != "" {
+		paths = []models.LibraryPath{{Category: models.CategoryRepacks, Path: s.libraryPath}}
+	}
+	return paths, nil
+}
+
+// applyLibrary processes the game files in every configured library path:
+// every directory is a game, which is registered under the path's category and
+// queued for a config and a metadata job.
 func (s *Service) applyLibrary(ctx context.Context) (string, error) {
-	if s.libraryPath == "" {
+	paths, err := s.libraryPaths(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(paths) == 0 {
 		return "", errors.New("library path not configured")
 	}
-	entries, err := os.ReadDir(s.libraryPath)
-	if err != nil {
-		return "", fmt.Errorf("read library: %w", err)
-	}
-	res := libraryResult{LibraryPath: s.libraryPath}
-	for _, e := range entries {
-		name := e.Name()
-		if strings.HasPrefix(name, ".") {
-			continue
-		}
-		path := filepath.Join(s.libraryPath, name)
-		info, err := os.Stat(path)
-		if err != nil || !info.IsDir() {
-			continue
-		}
-		game, created, err := s.upsertGame(ctx, name, path)
+	res := libraryResult{Paths: len(paths)}
+	for _, lib := range paths {
+		entries, err := os.ReadDir(lib.Path)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("read library %s: %w", lib.Path, err)
 		}
-		res.Games++
-		if created {
-			res.Created++
-		} else {
-			res.Updated++
-		}
-		for _, kind := range []models.JobKind{models.JobKindConfig, models.JobKindMetadata} {
-			if _, err := Enqueue(s.db, game.ID, kind, nil); err != nil {
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			path := filepath.Join(lib.Path, name)
+			info, err := os.Stat(path)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			game, created, err := s.upsertGame(ctx, name, path, lib.Category)
+			if err != nil {
 				return "", err
 			}
-			res.Jobs++
+			res.Games++
+			if created {
+				res.Created++
+			} else {
+				res.Updated++
+			}
+			for _, kind := range []models.JobKind{models.JobKindConfig, models.JobKindMetadata} {
+				if _, err := Enqueue(s.db, game.ID, kind, nil); err != nil {
+					return "", err
+				}
+				res.Jobs++
+			}
+			s.logger.Info("library game processed", "title", name, "game_id", game.ID, "library_path", path, "category", lib.Category)
 		}
-		s.logger.Info("library game processed", "title", name, "game_id", game.ID, "library_path", path)
 	}
 	b, _ := json.Marshal(res)
 	return string(b), nil
 }
 
 // upsertGame registers the game found in the library, keeping the row an
-// admin already created and refreshing its library path.
-func (s *Service) upsertGame(ctx context.Context, title, path string) (*models.Game, bool, error) {
+// admin already created and refreshing its library path and category.
+func (s *Service) upsertGame(ctx context.Context, title, path string, category models.LibraryCategory) (*models.Game, bool, error) {
 	var game models.Game
 	err := s.db.WithContext(ctx).Where("title = ?", title).First(&game).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		game = models.Game{Title: title, PEGIRating: defaultPEGIRating, LibraryPath: path}
+		game = models.Game{Title: title, PEGIRating: defaultPEGIRating, LibraryPath: path, Category: category}
 		if err := s.db.WithContext(ctx).Create(&game).Error; err != nil {
 			return nil, false, err
 		}
@@ -332,6 +352,7 @@ func (s *Service) upsertGame(ctx context.Context, title, path string) (*models.G
 		return nil, false, err
 	}
 	game.LibraryPath = path
+	game.Category = category
 	if err := s.db.WithContext(ctx).Save(&game).Error; err != nil {
 		return nil, false, err
 	}
