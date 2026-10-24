@@ -1,8 +1,8 @@
 <template>
-  <nav class="navbar" :class="themeClass">
+  <nav class="navbar netflix-nav" :class="themeClass">
     <div class="navbar-brand">
-      <a class="navbar-item">Gaming VDI</a>
-      <button class="button" @click="toggleTheme">{{ themeLabel }}</button>
+      <a class="navbar-item netflix-logo">Gaming VDI</a>
+      <button class="button netflix-toggle" @click="toggleTheme">{{ themeLabel }}</button>
     </div>
     <div class="navbar-menu">
       <div class="navbar-start">
@@ -13,28 +13,9 @@
     </div>
   </nav>
 
-  <section class="section" :class="themeClass">
-    <div class="container">
-      <h1 class="title">Games</h1>
-
-      <!-- Roles & permissions: which actions each role is allowed -->
-      <div class="box" :class="themeClass">
-        <h2 class="subtitle">Role: {{ role }}</h2>
-        <table class="table is-narrow is-fullwidth" :class="themeClass">
-          <thead>
-            <tr>
-              <th>Role</th>
-              <th>Allowed actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="r in roles" :key="r.role" :class="{ 'has-text-weight-bold': r.role === role }">
-              <td>{{ r.role }}</td>
-              <td>{{ r.actions }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+  <section class="section netflix-hero" :class="themeClass">
+    <div class="container is-fluid">
+      <h1 class="title netflix-title">Browse</h1>
 
       <div class="field">
         <label class="label">Search</label>
@@ -202,33 +183,27 @@
         </table>
       </div>
 
-      <table class="table is-fullwidth is-striped mt-4" :class="themeClass">
-        <thead>
-          <tr>
-            <th>Title</th>
-            <th>Category</th>
-            <th>PEGI</th>
-            <th>CPU</th>
-            <th>RAM</th>
-            <th>Disk</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="g in visibleGames" :key="g.id">
-            <td>{{ g.title }}</td>
-            <td>{{ g.category || "—" }}</td>
-            <td>{{ g.pegi_rating }}</td>
-            <td>{{ g.vm_config.cpu_cores }}</td>
-            <td>{{ g.vm_config.ram_size }} MB</td>
-            <td>{{ g.vm_config.disk_size }} GB</td>
-            <td>
-              <button v-if="can.play" class="button is-small is-primary" @click="play(g)">Play</button>
-              <span v-else class="tag is-light">Sign in as gamer to play</span>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="netflix-row">
+        <div class="netflix-grid">
+          <div v-for="g in visibleGames" :key="g.id" class="netflix-card">
+            <div class="netflix-card-inner">
+              <div class="netflix-card-poster">
+                <div class="netflix-card-title">{{ g.title }}</div>
+              </div>
+              <div class="netflix-card-info">
+                <div class="netflix-card-meta">
+                  <span class="tag is-dark">{{ g.pegi_rating }}</span>
+                  <span class="tag">{{ g.category || "—" }}</span>
+                </div>
+                <div class="netflix-card-actions">
+                  <button v-if="can.play" class="button is-small is-danger netflix-play" @click="play(g)">▶ Play</button>
+                  <span v-else class="tag is-light">Sign in to play</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
 
       <div v-if="error" class="notification is-danger mt-4">{{ error }}</div>
       <div v-if="msg" class="notification is-info mt-4">{{ msg }}</div>
@@ -489,15 +464,102 @@ function logout() {
 </script>
 
 <style>
+/* Netflix-inspired theme */
+.netflix-nav {
+  background: linear-gradient(180deg, rgba(0,0,0,0.9) 0%, rgba(0,0,0,0.7) 100%);
+  border: none;
+}
+.netflix-logo {
+  color: #e50914 !important;
+  font-weight: 800;
+  font-size: 1.5rem;
+  letter-spacing: 0.05em;
+}
+.netflix-toggle {
+  background: transparent;
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.5);
+}
+.netflix-hero {
+  background: radial-gradient(ellipse at top, #141414 0%, #000000 100%);
+  min-height: 100vh;
+  padding-top: 2rem;
+}
+.netflix-title {
+  color: #fff;
+  font-size: 2rem;
+  font-weight: 700;
+  margin-bottom: 1.5rem;
+}
+.netflix-row {
+  margin-top: 2rem;
+}
+.netflix-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
+}
+.netflix-card {
+  position: relative;
+  transition: transform 0.2s ease-in-out;
+  cursor: pointer;
+}
+.netflix-card:hover {
+  transform: scale(1.05);
+  z-index: 10;
+}
+.netflix-card-inner {
+  background: #181818;
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+}
+.netflix-card-poster {
+  height: 280px;
+  background: linear-gradient(135deg, #e50914 0%, #831010 100%);
+  display: flex;
+  align-items: flex-end;
+  padding: 1rem;
+}
+.netflix-card-title {
+  color: #fff;
+  font-weight: 600;
+  font-size: 0.9rem;
+  text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+}
+.netflix-card-info {
+  padding: 0.75rem;
+  background: #181818;
+}
+.netflix-card-meta {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+.netflix-card-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.netflix-play {
+  background: #e50914;
+  border: none;
+  color: #fff;
+  font-weight: 600;
+}
+.netflix-play:hover {
+  background: #f40612;
+}
+
 /* Bulma dark theme support */
 .is-dark-theme {
-  background: #1a1a1a;
+  background: #000000;
   color: #ddd;
 }
 .is-dark-theme .table td,
 .is-dark-theme .table th {
-  border-color: #444;
-  background: #222;
+  border-color: #333;
+  background: #141414;
   color: #ddd;
 }
 .is-dark-theme .box,
@@ -510,5 +572,8 @@ function logout() {
 .is-dark-theme .notification {
   background: #2a2a2a;
   border-color: #444;
+}
+.is-dark-theme .label {
+  color: #ddd;
 }
 </style>
