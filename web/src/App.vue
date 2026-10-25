@@ -192,8 +192,10 @@
               </div>
               <div class="netflix-card-info">
                 <div class="netflix-card-meta">
-                  <span class="tag is-dark">{{ g.pegi_rating }}</span>
-                  <span class="tag">{{ g.category || "—" }}</span>
+                  <span v-for="genre in metaFor(g).genres.slice(0, 3)" :key="genre" class="tag">{{ genre }}</span>
+                  <span v-if="metaFor(g).year" class="tag is-dark">{{ metaFor(g).year }}</span>
+                  <span v-if="metaFor(g).rating" class="tag is-dark">{{ metaFor(g).rating }}</span>
+                  <span class="tag is-dark">{{ metaFor(g).pegi || g.pegi_rating }}</span>
                 </div>
                 <div class="netflix-card-actions">
                   <button v-if="can.play" class="button is-small is-danger netflix-play" @click="play(g)">▶ Play</button>
@@ -263,6 +265,22 @@ const visibleGames = computed(() => {
   const q = query.value.toLowerCase()
   return allGames.value.filter((g) => g.title.toLowerCase().includes(q))
 })
+
+// Parse the remote-source metadata stored on the game row. Database fields
+// (title, pegi_rating, category) are only fallbacks; the catalog presents the
+// merged fitgirl/rawg/steam/... data from Game.metadata.
+function metaFor(g) {
+  const out = { genres: [], year: "", rating: "", pegi: "" }
+  if (!g || !g.metadata) return out
+  try {
+    const p = JSON.parse(g.metadata)
+    if (Array.isArray(p.genres)) out.genres = p.genres
+    if (p.release_date) out.year = String(p.release_date).slice(0, 4)
+    if (p.metacritic_score) out.rating = String(p.metacritic_score)
+    if (p.pegi_rating) out.pegi = p.pegi_rating
+  } catch {}
+  return out
+}
 
 function toggleTheme() {
   const next = theme.value === "dark" ? "light" : "dark"
