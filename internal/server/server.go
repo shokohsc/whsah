@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -61,17 +62,18 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /library/paths", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListLibraryPaths))))
 	mux.Handle("POST /library/paths", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateLibraryPath))))
 	mux.Handle("DELETE /library/paths/{id}", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleDeleteLibraryPath))))
-	mux.Handle("GET /jobs/{id}", s.auth(http.HandlerFunc(s.handleGetJob)))
+	mux.Handle("GET /jobs/{id}", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleGetJob))))
 	mux.Handle("GET /sessions", s.auth(http.HandlerFunc(s.handleListSessions)))
 	mux.Handle("POST /sessions", s.auth(http.HandlerFunc(s.handleCreateSession)))
 	mux.Handle("DELETE /sessions/", s.auth(http.HandlerFunc(s.handleDeleteSession)))
 	mux.Handle("POST /sessions/{id}/override", s.auth(http.HandlerFunc(s.handleOverrideVMConfig)))
+	mux.Handle("POST /sessions/{id}/heartbeat", s.auth(http.HandlerFunc(s.handleSessionHeartbeat)))
 	mux.Handle("GET /users", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListUsers))))
 	mux.Handle("PUT /users/{id}", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleUpdateUserRole))))
 	mux.Handle("GET /me", s.auth(http.HandlerFunc(s.handleMe)))
 
 	// Agent-only endpoints: every agent-to-Proxmox interaction goes through
-	// the server. Agents authenticate with the shared AgentToken.
+	// the server. Each agent authenticates with the token for its own VM.
 	mux.Handle("POST /agent/vm/{vmid}/start", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMStart)))
 	mux.Handle("POST /agent/vm/{vmid}/stop", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMStop)))
 	mux.Handle("GET /agent/vm/{vmid}/config", s.requireAgentToken(http.HandlerFunc(s.handleAgentVMConfig)))
@@ -153,44 +155,35 @@ func (s *Server) auth(next http.Handler) http.Handler {
 }
 
 // ensureUser returns the stored user for an identity, creating it on first
-// login. OIDC subjects in AdminSubjects are provisioned (or promoted) to admin.
+// login. The OIDC subject is the only identity key: usernames and emails can
+// be mutable at some providers. Admins are matched by subject only, and a user
+// promoted by VDI_ADMIN_SUBJECTS is demoted when removed from it.
 func (s *Server) ensureUser(id Identity) (models.User, error) {
 	var u models.User
-	q := s.db.Where("username = ?", id.Subject)
-	if id.Email != "" {
-		q = q.Or("email = ?", id.Email)
-	}
-	err := q.First(&u).Error
+	err := s.db.Where("subject = ?", id.Subject).First(&u).Error
 	if err == nil {
-		if s.isAdminSubject(id) && u.Role != models.RoleAdmin {
-			u.Role = models.RoleAdmin
-			if err := s.db.Save(&u).Error; err != nil {
-				return u, err
-			}
-			s.logger.Info("user promoted to admin", "user_id", u.ID, "username", u.Username)
-		}
-		return u, nil
+		return s.syncAdmin(u, id)
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return u, err
 	}
-	email := id.Email
-	if email == "" {
-		email = id.Subject + "@oidc.local"
+	email := id.Subject + "@oidc.local"
+	if id.EmailVerified && id.Email != "" {
+		email = id.Email
 	}
 	username := id.Username
 	if username == "" {
 		username = id.Subject
 	}
-	role := models.RoleGamer
+	u = models.User{Subject: id.Subject, Username: username, Email: email, Age: s.cfg.DefaultAge, Role: models.RoleGamer}
 	if s.isAdminSubject(id) {
-		role = models.RoleAdmin
+		u.Role = models.RoleAdmin
+		u.EnvAdmin = true
 	}
-	u = models.User{Username: username, Email: email, Age: s.cfg.DefaultAge, Role: role}
 	if err := s.db.Create(&u).Error; err != nil {
 		// Lost a provisioning race: return the row another request created.
-		if e := s.db.Where("username = ? OR email = ?", username, email).First(&u).Error; e == nil {
-			return u, nil
+		if e := s.db.Where("subject = ?", id.Subject).First(&u).Error; e == nil {
+			return s.syncAdmin(u, id)
 		}
 		return u, err
 	}
@@ -198,12 +191,37 @@ func (s *Server) ensureUser(id Identity) (models.User, error) {
 	return u, nil
 }
 
-// isAdminSubject reports whether the identity is listed as an admin. The
-// subject is the provider's user ID (a UUID with Pocket ID), so the username
-// and email claims are matched as well.
+// syncAdmin applies the VDI_ADMIN_SUBJECTS list to an existing user. Only
+// users promoted by that list are demoted; manually assigned admins stay.
+func (s *Server) syncAdmin(u models.User, id Identity) (models.User, error) {
+	if s.isAdminSubject(id) {
+		if u.Role != models.RoleAdmin || !u.EnvAdmin {
+			u.Role = models.RoleAdmin
+			u.EnvAdmin = true
+			if err := s.db.Model(&u).Updates(map[string]any{"role": u.Role, "env_admin": true}).Error; err != nil {
+				return u, err
+			}
+			s.logger.Info("user promoted to admin", "user_id", u.ID, "username", u.Username)
+		}
+		return u, nil
+	}
+	if u.EnvAdmin {
+		u.Role = models.RoleGamer
+		u.EnvAdmin = false
+		if err := s.db.Model(&u).Updates(map[string]any{"role": u.Role, "env_admin": false}).Error; err != nil {
+			return u, err
+		}
+		s.logger.Info("user demoted from admin", "user_id", u.ID, "username", u.Username)
+	}
+	return u, nil
+}
+
+// isAdminSubject reports whether the identity's immutable subject is listed
+// as an admin. Usernames and emails are not matched: both can be user-editable
+// at some providers.
 func (s *Server) isAdminSubject(id Identity) bool {
 	for _, a := range s.cfg.AdminSubjects {
-		if a == id.Subject || (id.Username != "" && a == id.Username) || (id.Email != "" && a == id.Email) {
+		if a == id.Subject {
 			return true
 		}
 	}
@@ -331,7 +349,22 @@ func randomState() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
+// handleListGames returns the catalog filtered by the caller's age. Anonymous
+// callers only see the lowest PEGI rating. The internal library path is only
+// returned to admins.
 func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
+	age, admin := 3, false
+	id := userID(r)
+	if id.Subject == "" {
+		if token := bearerToken(r); token != "" {
+			if verified, err := s.verifier.Verify(r.Context(), token); err == nil {
+				id = verified
+			}
+		}
+	}
+	if u, ok := s.userBySubject(id.Subject); ok {
+		age, admin = u.Age, u.Role == models.RoleAdmin
+	}
 	var games []models.Game
 	if err := s.db.Find(&games).Error; err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
@@ -341,15 +374,22 @@ func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
 		ID             uint                   `json:"id"`
 		Title          string                 `json:"title"`
 		SanitizedTitle string                 `json:"sanitized_title"`
-		LibraryPath    string                 `json:"library_path"`
+		LibraryPath    string                 `json:"library_path,omitempty"`
 		Category       models.LibraryCategory `json:"category"`
 		PEGIRating     string                 `json:"pegi_rating"`
 		VMConfig       models.VMConfig        `json:"vm_config"`
 		Metadata       string                 `json:"metadata"`
 	}
-	out := make([]gameOut, len(games))
-	for i, g := range games {
-		out[i] = gameOut{ID: g.ID, Title: g.Title, SanitizedTitle: g.SanitizedName(), LibraryPath: g.LibraryPath, Category: g.Category, PEGIRating: g.PEGIRating, VMConfig: g.VMConfig, Metadata: g.Metadata}
+	out := make([]gameOut, 0, len(games))
+	for _, g := range games {
+		if !admin && !ageAllowed(age, g.PEGIRating) {
+			continue
+		}
+		o := gameOut{ID: g.ID, Title: g.Title, SanitizedTitle: g.SanitizedName(), Category: g.Category, PEGIRating: g.PEGIRating, VMConfig: g.VMConfig, Metadata: g.Metadata}
+		if admin {
+			o.LibraryPath = g.LibraryPath
+		}
+		out = append(out, o)
 	}
 	s.writeJSON(w, http.StatusOK, out)
 }
@@ -360,8 +400,8 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
 		return
 	}
-	if g.Title == "" || g.PEGIRating == "" {
-		http.Error(w, `{"error":"title and pegi_rating required"}`, http.StatusBadRequest)
+	if g.Title == "" || !models.ValidPEGIRating(g.PEGIRating) {
+		http.Error(w, `{"error":"title and a valid pegi_rating (3, 7, 12, 16, 18) required"}`, http.StatusBadRequest)
 		return
 	}
 	if err := s.db.Create(&g).Error; err != nil {
@@ -402,17 +442,12 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	case !vmNameRE.MatchString(req.Name):
 		http.Error(w, `{"error":"name must start with a letter and contain only letters, digits and hyphens"}`, http.StatusBadRequest)
 		return
-	case req.CPUCores < 1 || req.CPUCores > 128:
-		http.Error(w, `{"error":"cpu_cores must be between 1 and 128"}`, http.StatusBadRequest)
-		return
-	case req.RAMSize < 512 || req.RAMSize > 1048576:
-		http.Error(w, `{"error":"ram_size must be between 512 and 1048576 MB"}`, http.StatusBadRequest)
-		return
-	case req.DiskSize < 1 || req.DiskSize > 65536:
-		http.Error(w, `{"error":"disk_size must be between 1 and 65536 GB"}`, http.StatusBadRequest)
-		return
 	case !vmVGAs[req.VGPU]:
 		http.Error(w, `{"error":"invalid vgpu"}`, http.StatusBadRequest)
+		return
+	}
+	if msg := validateVMConfig(req.CPUCores, req.RAMSize, req.DiskSize); msg != "" {
+		http.Error(w, `{"error":"`+msg+`"}`, http.StatusBadRequest)
 		return
 	}
 	if s.px == nil {
@@ -422,7 +457,7 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	vmid, err := s.px.Clone(req.TemplateID, req.Name, req.CPUCores, req.RAMSize, req.DiskSize, req.VGPU)
 	if err != nil {
 		s.logger.Error("custom vm clone failed", "template_id", req.TemplateID, "name", req.Name, "err", logging.SafeError(err))
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
+		http.Error(w, `{"error":"proxmox request failed"}`, http.StatusBadGateway)
 		return
 	}
 	s.logger.Info("custom vm created", "vm_id", vmid, "template_id", req.TemplateID, "name", req.Name, "cpu_cores", req.CPUCores, "ram_size", req.RAMSize, "disk_size", req.DiskSize, "vgpu", req.VGPU)
@@ -640,17 +675,19 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, job)
 }
 
-func currentUser(s *Server, r *http.Request) (models.User, bool) {
-	id := userID(r)
-	q := s.db.Where("username = ?", id.Subject)
-	if id.Email != "" {
-		q = q.Or("email = ?", id.Email)
-	}
+func (s *Server) userBySubject(subject string) (models.User, bool) {
 	var u models.User
-	if err := q.First(&u).Error; err != nil {
+	if subject == "" {
+		return u, false
+	}
+	if err := s.db.Where("subject = ?", subject).First(&u).Error; err != nil {
 		return u, false
 	}
 	return u, true
+}
+
+func currentUser(s *Server, r *http.Request) (models.User, bool) {
+	return s.userBySubject(userID(r).Subject)
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
@@ -671,13 +708,15 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, sessions)
 }
 
+// handleCreateSession clones a VM server-side and binds it to the session. The
+// client never chooses a VM id, so it cannot point the backup/deletion paths at
+// someone else's VM.
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		GameID           uint   `json:"game_id"`
-		VMID             string `json:"vm_id"`
-		OverrideCPUCores *int   `json:"cpu_cores"`
-		OverrideRAMSize  *int   `json:"ram_size"`
-		OverrideDiskSize *int   `json:"disk_size"`
+		GameID           uint `json:"game_id"`
+		OverrideCPUCores *int `json:"cpu_cores"`
+		OverrideRAMSize  *int `json:"ram_size"`
+		OverrideDiskSize *int `json:"disk_size"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
@@ -697,11 +736,36 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"age rating not allowed"}`, http.StatusForbidden)
 		return
 	}
+	cores, ram, disk := g.VMConfig.CPUCores, g.VMConfig.RAMSize, g.VMConfig.DiskSize
+	if req.OverrideCPUCores != nil {
+		cores = *req.OverrideCPUCores
+	}
+	if req.OverrideRAMSize != nil {
+		ram = *req.OverrideRAMSize
+	}
+	if req.OverrideDiskSize != nil {
+		disk = *req.OverrideDiskSize
+	}
+	if msg := validateVMConfig(cores, ram, disk); msg != "" {
+		http.Error(w, `{"error":"`+msg+`"}`, http.StatusBadRequest)
+		return
+	}
+	if s.px == nil || s.cfg.VMTemplateID <= 0 {
+		http.Error(w, `{"error":"vm provisioning not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
 	now := time.Now()
+	name := fmt.Sprintf("vdi-g%d-u%d-%d", g.ID, u.ID, now.Unix())
+	vmid, err := s.px.Clone(s.cfg.VMTemplateID, name, cores, ram, disk, "")
+	if err != nil {
+		s.logger.Error("session vm clone failed", "user_id", u.ID, "game_id", g.ID, "err", logging.SafeError(err))
+		http.Error(w, `{"error":"vm provisioning failed"}`, http.StatusBadGateway)
+		return
+	}
 	sess := models.Session{
 		UserID:           u.ID,
 		GameID:           g.ID,
-		VMID:             req.VMID,
+		VMID:             strconv.Itoa(vmid),
 		Backups:          0,
 		LastUserSession:  &now,
 		OverrideCPUCores: req.OverrideCPUCores,
@@ -709,12 +773,26 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		OverrideDiskSize: req.OverrideDiskSize,
 	}
 	if err := s.db.Create(&sess).Error; err != nil {
+		_ = s.px.Delete(strconv.Itoa(vmid))
 		s.logger.Error("session create failed", "user_id", u.ID, "game_id", g.ID, "err", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
 	s.logger.Info("session created", "session_id", sess.ID, "user_id", u.ID, "game_id", g.ID, "vm_id", sess.VMID)
 	s.writeJSON(w, http.StatusCreated, sess)
+}
+
+// validateVMConfig returns an error message when the values are out of range.
+func validateVMConfig(cores, ram, disk int) string {
+	switch {
+	case cores < 1 || cores > 128:
+		return "cpu_cores must be between 1 and 128"
+	case ram < 512 || ram > 1048576:
+		return "ram_size must be between 512 and 1048576 MB"
+	case disk < 1 || disk > 65536:
+		return "disk_size must be between 1 and 65536 GB"
+	}
+	return ""
 }
 
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
@@ -746,6 +824,38 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleSessionHeartbeat refreshes the activity timestamp that drives VM
+// deletion, so an active session is never reaped.
+func (s *Server) handleSessionHeartbeat(w http.ResponseWriter, r *http.Request) {
+	id, err := sessionIDFromPath(r)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+	u, ok := currentUser(s, r)
+	if !ok {
+		http.Error(w, `{"error":"user not found"}`, http.StatusNotFound)
+		return
+	}
+	q := s.db.Where("id = ?", id)
+	if u.Role != models.RoleAdmin {
+		q = q.Where("user_id = ?", u.ID)
+	}
+	var sess models.Session
+	if err := q.First(&sess).Error; err != nil {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	now := time.Now()
+	if err := s.db.Model(&sess).Update("last_user_session", now).Error; err != nil {
+		s.logger.Error("session heartbeat failed", "session_id", sess.ID, "err", err)
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	sess.LastUserSession = &now
+	s.writeJSON(w, http.StatusOK, sess)
+}
+
 func (s *Server) handleOverrideVMConfig(w http.ResponseWriter, r *http.Request) {
 	id, err := sessionIDFromPath(r)
 	if err != nil {
@@ -773,6 +883,18 @@ func (s *Server) handleOverrideVMConfig(w http.ResponseWriter, r *http.Request) 
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.CPUCores != nil && (*req.CPUCores < 1 || *req.CPUCores > 128) {
+		http.Error(w, `{"error":"cpu_cores must be between 1 and 128"}`, http.StatusBadRequest)
+		return
+	}
+	if req.RAMSize != nil && (*req.RAMSize < 512 || *req.RAMSize > 1048576) {
+		http.Error(w, `{"error":"ram_size must be between 512 and 1048576 MB"}`, http.StatusBadRequest)
+		return
+	}
+	if req.DiskSize != nil && (*req.DiskSize < 1 || *req.DiskSize > 65536) {
+		http.Error(w, `{"error":"disk_size must be between 1 and 65536 GB"}`, http.StatusBadRequest)
 		return
 	}
 	updates := map[string]any{}
@@ -848,6 +970,7 @@ func (s *Server) handleUpdateUserRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u.Role = req.Role
+	u.EnvAdmin = false
 	if err := s.db.Save(&u).Error; err != nil {
 		s.logger.Error("user role update failed", "user_id", u.ID, "err", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
@@ -889,12 +1012,20 @@ func (s *Server) requireRole(roles ...models.Role) func(http.Handler) http.Handl
 	}
 }
 
-// requireAgentToken authenticates agents via the shared AgentToken bearer
-// token. Only agents may call the VM proxy endpoints.
+// requireAgentToken authenticates an agent with the token issued for the VM in
+// the path. A token for VM A cannot be used to control VM B.
 func (s *Server) requireAgentToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, err := strconv.Atoi(r.PathValue("vmid"))
+		if err != nil || n <= 0 {
+			http.Error(w, `{"error":"invalid vmid"}`, http.StatusBadRequest)
+			return
+		}
+		vmid := strconv.Itoa(n)
+		r.SetPathValue("vmid", vmid)
+		expected, ok := s.cfg.AgentTokens[vmid]
 		token := bearerToken(r)
-		if token == "" || token != s.cfg.AgentToken {
+		if !ok || token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
 			s.logger.Warn("agent auth failed", "path", r.URL.Path, "method", r.Method)
 			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
 			return
@@ -915,7 +1046,7 @@ func (s *Server) handleAgentVMStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.px.Start(vmid); err != nil {
 		s.logger.Error("vm start failed", "vm_id", vmid, "err", logging.SafeError(err))
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
+		http.Error(w, `{"error":"proxmox request failed"}`, http.StatusBadGateway)
 		return
 	}
 	s.logger.Info("vm started", "vm_id", vmid)
@@ -934,7 +1065,7 @@ func (s *Server) handleAgentVMStop(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.px.Stop(vmid); err != nil {
 		s.logger.Error("vm stop failed", "vm_id", vmid, "err", logging.SafeError(err))
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
+		http.Error(w, `{"error":"proxmox request failed"}`, http.StatusBadGateway)
 		return
 	}
 	s.logger.Info("vm stopped", "vm_id", vmid)
@@ -954,7 +1085,7 @@ func (s *Server) handleAgentVMConfig(w http.ResponseWriter, r *http.Request) {
 	cfg, err := s.px.GetConfig(vmid)
 	if err != nil {
 		s.logger.Error("vm config fetch failed", "vm_id", vmid, "err", logging.SafeError(err))
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
+		http.Error(w, `{"error":"proxmox request failed"}`, http.StatusBadGateway)
 		return
 	}
 	s.logger.Debug("vm config fetched", "vm_id", vmid)
@@ -1010,20 +1141,11 @@ func jobIDFromPath(r *http.Request) (uint, error) {
 }
 
 // ageAllowed reports whether a user of the given age may play a game with the
-// given PEGI rating (PEGI floors: 3, 7, 12, 16, 18).
+// given PEGI rating. Unknown ratings are denied rather than treated as 0.
 func ageAllowed(age int, pegi string) bool {
-	floor := 0
-	switch pegi {
-	case "3":
-		floor = 3
-	case "7":
-		floor = 7
-	case "12":
-		floor = 12
-	case "16":
-		floor = 16
-	case "18":
-		floor = 18
+	floor, ok := models.PEGIFloor(pegi)
+	if !ok {
+		return false
 	}
 	return age >= floor
 }

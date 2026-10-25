@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -40,9 +41,9 @@ func testDB(t *testing.T) *gorm.DB {
 func seedUsers(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	users := []models.User{
-		{Username: "dev-user", Email: "dev@example.local", Age: 30, Role: models.RoleGamer},
-		{Username: "child", Email: "child@example.local", Age: 10, Role: models.RoleGamer},
-		{Username: "admin", Email: "admin@example.local", Age: 40, Role: models.RoleAdmin},
+		{Subject: "dev-user", Username: "dev-user", Email: "dev@example.local", Age: 30, Role: models.RoleGamer},
+		{Subject: "child", Username: "child", Email: "child@example.local", Age: 10, Role: models.RoleGamer},
+		{Subject: "admin", Username: "admin", Email: "admin@example.local", Age: 40, Role: models.RoleAdmin},
 	}
 	for i := range users {
 		if err := db.Create(&users[i]).Error; err != nil {
@@ -63,6 +64,21 @@ func seedGames(t *testing.T, db *gorm.DB) {
 			t.Fatalf("seed game: %v", err)
 		}
 	}
+}
+
+// testSessionServer returns a server with a fake Proxmox that accepts clones.
+func testSessionServer(t *testing.T, db *gorm.DB) *Server {
+	t.Helper()
+	pxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/clone") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"vmid": 100}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": nil})
+	}))
+	t.Cleanup(pxSrv.Close)
+	return New(db, NewVerifier(OIDC{}), proxmox.New(pxSrv.URL, "pve-node", "token"), config.Config{DefaultAge: 18, VMTemplateID: 9000})
 }
 
 func withUserContext(r *http.Request, sub string) *http.Request {
@@ -105,20 +121,49 @@ func TestConfig(t *testing.T) {
 
 func TestListGames(t *testing.T) {
 	db := testDB(t)
+	seedUsers(t, db)
 	seedGames(t, db)
 	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+	type gameOut struct {
+		Title       string `json:"title"`
+		LibraryPath string `json:"library_path"`
+	}
+	list := func(r *http.Request) []gameOut {
+		w := httptest.NewRecorder()
+		srv.handleListGames(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("list games status = %d", w.Code)
+		}
+		var games []gameOut
+		if err := json.Unmarshal(w.Body.Bytes(), &games); err != nil {
+			t.Fatalf("decode games: %v", err)
+		}
+		return games
+	}
+
+	// Anonymous callers only see the lowest PEGI rating.
 	r := httptest.NewRequest(http.MethodGet, "/games", nil)
-	w := httptest.NewRecorder()
-	srv.handleListGames(w, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("list games status = %d", w.Code)
+	if games := list(r); len(games) != 1 || games[0].Title != "Kids Game" {
+		t.Fatalf("anonymous games = %+v, want only Kids Game", games)
 	}
-	var games []models.Game
-	if err := json.Unmarshal(w.Body.Bytes(), &games); err != nil {
-		t.Fatalf("decode games: %v", err)
-	}
+
+	// An adult gamer sees all ratings, but no internal library paths.
+	r = withUserContext(httptest.NewRequest(http.MethodGet, "/games", nil), "dev-user")
+	games := list(r)
 	if len(games) != 3 {
-		t.Fatalf("expected 3 games, got %d", len(games))
+		t.Fatalf("adult games = %d, want 3", len(games))
+	}
+	for _, g := range games {
+		if g.LibraryPath != "" {
+			t.Fatalf("library path leaked to gamer: %+v", g)
+		}
+	}
+
+	// Admins see the library path for management.
+	r = withUserContext(httptest.NewRequest(http.MethodGet, "/games", nil), "admin")
+	games = list(r)
+	if len(games) != 3 || games[0].LibraryPath == "" {
+		t.Fatalf("admin games = %+v, want paths", games)
 	}
 }
 
@@ -126,10 +171,10 @@ func TestCreateSessionAgeGate(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
 	seedGames(t, db)
-	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+	srv := testSessionServer(t, db)
 
 	// adult (30) can play 18-rated game
-	r := httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{"game_id": 3, "vm_id": "vm-1"}))
+	r := httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{"game_id": 3}))
 	r = withUserContext(r, "dev-user")
 	w := httptest.NewRecorder()
 	srv.handleCreateSession(w, r)
@@ -138,7 +183,7 @@ func TestCreateSessionAgeGate(t *testing.T) {
 	}
 
 	// child (10) cannot play 18-rated game
-	r = httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{"game_id": 3, "vm_id": "vm-2"}))
+	r = httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{"game_id": 3}))
 	r = withUserContext(r, "child")
 	w = httptest.NewRecorder()
 	srv.handleCreateSession(w, r)
@@ -147,7 +192,7 @@ func TestCreateSessionAgeGate(t *testing.T) {
 	}
 
 	// child can play 3-rated game
-	r = httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{"game_id": 1, "vm_id": "vm-3"}))
+	r = httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{"game_id": 1}))
 	r = withUserContext(r, "child")
 	w = httptest.NewRecorder()
 	srv.handleCreateSession(w, r)
@@ -160,11 +205,10 @@ func TestCreateSessionVMConfigOverride(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
 	seedGames(t, db)
-	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+	srv := testSessionServer(t, db)
 
 	r := httptest.NewRequest(http.MethodPost, "/sessions", reqBody(map[string]any{
 		"game_id":   1,
-		"vm_id":     "vm-override",
 		"cpu_cores": 8,
 		"ram_size":  16384,
 		"disk_size": 512,
@@ -177,8 +221,11 @@ func TestCreateSessionVMConfigOverride(t *testing.T) {
 	}
 
 	var sess models.Session
-	if err := db.First(&sess, "vm_id = ?", "vm-override").Error; err != nil {
-		t.Fatalf("session not found: %v", err)
+	if err := json.Unmarshal(w.Body.Bytes(), &sess); err != nil {
+		t.Fatalf("decode session: %v", err)
+	}
+	if sess.VMID != "100" {
+		t.Fatalf("vm id = %q, want server-allocated 100", sess.VMID)
 	}
 	if sess.OverrideCPUCores == nil || *sess.OverrideCPUCores != 8 {
 		t.Fatalf("expected override cpu_cores 8, got %v", sess.OverrideCPUCores)
@@ -280,6 +327,29 @@ func TestOverrideVMConfig(t *testing.T) {
 	}
 }
 
+func TestSessionHeartbeatRefreshesActivity(t *testing.T) {
+	db := testDB(t)
+	seedUsers(t, db)
+	old := time.Now().Add(-48 * time.Hour)
+	db.Create(&models.Session{UserID: 1, GameID: 1, VMID: "100", LastUserSession: &old})
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	r := httptest.NewRequest(http.MethodPost, "/sessions/1/heartbeat", nil)
+	r = withUserContext(r, "dev-user")
+	w := httptest.NewRecorder()
+	srv.handleSessionHeartbeat(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var sess models.Session
+	if err := db.First(&sess, 1).Error; err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if sess.LastUserSession == nil || !sess.LastUserSession.After(old) {
+		t.Fatalf("heartbeat did not refresh last_user_session: %v", sess.LastUserSession)
+	}
+}
+
 func TestCreateGameRequiresAdmin(t *testing.T) {
 	db := testDB(t)
 	seedUsers(t, db)
@@ -365,7 +435,7 @@ func TestAgentVMProxyStartStopConfig(t *testing.T) {
 	defer pxSrv.Close()
 
 	px := proxmox.New(pxSrv.URL, "pve-node", "token")
-	srv := New(db, NewVerifier(OIDC{}), px, config.Config{AgentToken: "agent-secret"})
+	srv := New(db, NewVerifier(OIDC{}), px, config.Config{AgentTokens: map[string]string{"100": "agent-secret"}})
 
 	// start
 	r := httptest.NewRequest(http.MethodPost, "/agent/vm/100/start", nil)
@@ -402,6 +472,24 @@ func TestAgentVMProxyStartStopConfig(t *testing.T) {
 	}
 	if len(configRequested) != 1 || configRequested[0] != "100" {
 		t.Fatalf("unexpected config requested: %v", configRequested)
+	}
+
+	// A token is only valid for the VM it was issued for.
+	r = httptest.NewRequest(http.MethodPost, "/agent/vm/101/start", nil)
+	r.Header.Set("Authorization", "Bearer agent-secret")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-vm token status = %d, want 401", w.Code)
+	}
+
+	// Non-numeric VM ids never reach Proxmox.
+	r = httptest.NewRequest(http.MethodPost, "/agent/vm/abc/start", nil)
+	r.Header.Set("Authorization", "Bearer agent-secret")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid vmid status = %d, want 400", w.Code)
 	}
 }
 
@@ -724,7 +812,7 @@ func TestEnsureUserAdminSubjectAndPromotion(t *testing.T) {
 	}
 
 	// an existing non-admin listed as admin subject is promoted
-	db.Create(&models.User{Username: "promo", Email: "promo@example.local", Age: 20, Role: models.RoleGamer})
+	db.Create(&models.User{Subject: "promo", Username: "promo", Email: "promo@example.local", Age: 20, Role: models.RoleGamer})
 	srv.cfg.AdminSubjects = []string{"promo"}
 	u, err = srv.ensureUser(Identity{Subject: "promo", Email: "promo@example.local"})
 	if err != nil {
@@ -735,17 +823,37 @@ func TestEnsureUserAdminSubjectAndPromotion(t *testing.T) {
 	}
 }
 
-func TestEnsureUserAdminMatchedByUsername(t *testing.T) {
+func TestEnsureUserAdminMatchedByUsernameOnlyIsNotAdmin(t *testing.T) {
 	db := testDB(t)
 	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{DefaultAge: 18, AdminSubjects: []string{"alice"}})
 
-	// Pocket ID subjects are opaque IDs, so the username claim identifies the admin.
+	// Usernames are mutable at some providers, so they must never grant admin.
 	u, err := srv.ensureUser(Identity{Subject: "8f14e45f-ea1c-4a3b-9f2b-1b6f5f0a2c3d", Username: "alice"})
 	if err != nil {
 		t.Fatalf("ensureUser: %v", err)
 	}
-	if u.Role != models.RoleAdmin {
-		t.Fatalf("expected admin, got %s", u.Role)
+	if u.Role != models.RoleGamer {
+		t.Fatalf("expected gamer, got %s", u.Role)
+	}
+}
+
+func TestEnsureUserAdminDemotion(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{DefaultAge: 18, AdminSubjects: []string{"boss"}})
+
+	u, err := srv.ensureUser(Identity{Subject: "boss"})
+	if err != nil || u.Role != models.RoleAdmin {
+		t.Fatalf("expected admin, got %+v err=%v", u, err)
+	}
+
+	// Removing the subject from the list demotes the env-promoted admin.
+	srv.cfg.AdminSubjects = nil
+	u, err = srv.ensureUser(Identity{Subject: "boss"})
+	if err != nil {
+		t.Fatalf("ensureUser: %v", err)
+	}
+	if u.Role != models.RoleGamer || u.EnvAdmin {
+		t.Fatalf("expected demotion to gamer, got %+v", u)
 	}
 }
 
@@ -805,13 +913,25 @@ func TestJobRoutesAuth(t *testing.T) {
 		t.Fatalf("no token job status = %d, want 401", w.Code)
 	}
 
-	// GET /jobs/{id} with a token succeeds (dev mode accepts any token)
+	// A gamer cannot read jobs; they are admin-only.
+	r = httptest.NewRequest(http.MethodGet, "/jobs/"+strconv.Itoa(int(job.ID)), nil)
+	r.Header.Set("Authorization", "Bearer any")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("gamer job status = %d, want 403; body=%s", w.Code, w.Body.String())
+	}
+
+	// An admin can read the job.
+	if err := db.Model(&models.User{}).Where("subject = ?", "dev-user").Update("role", models.RoleAdmin).Error; err != nil {
+		t.Fatalf("promote user: %v", err)
+	}
 	r = httptest.NewRequest(http.MethodGet, "/jobs/"+strconv.Itoa(int(job.ID)), nil)
 	r.Header.Set("Authorization", "Bearer any")
 	w = httptest.NewRecorder()
 	srv.Routes().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
-		t.Fatalf("token job status = %d, want 200; body=%s", w.Code, w.Body.String())
+		t.Fatalf("admin job status = %d, want 200; body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -1043,7 +1163,7 @@ func TestCreateVMRouteRequiresAdmin(t *testing.T) {
 
 func TestListGamesIncludesSanitizedTitle(t *testing.T) {
 	db := testDB(t)
-	if err := db.Create(&models.Game{Title: "Hades [FitGirl Repack]", PEGIRating: "12", LibraryPath: "/games/hades"}).Error; err != nil {
+	if err := db.Create(&models.Game{Title: "Hades [FitGirl Repack]", PEGIRating: "3", LibraryPath: "/games/hades"}).Error; err != nil {
 		t.Fatalf("seed game: %v", err)
 	}
 	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())

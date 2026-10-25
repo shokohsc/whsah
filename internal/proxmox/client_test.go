@@ -150,6 +150,54 @@ func TestStartStopDelete(t *testing.T) {
 	}
 }
 
+func TestRejectsNonNumericVMID(t *testing.T) {
+	client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request for invalid vmid: %s", r.URL.Path)
+	})
+	for name, call := range map[string]func(string) error{
+		"start":  client.Start,
+		"stop":   client.Stop,
+		"delete": client.Delete,
+	} {
+		if err := call("../../access/users"); err == nil {
+			t.Fatalf("%s accepted a non-numeric vmid", name)
+		}
+	}
+	if _, err := client.GetConfig("100/../../access"); err == nil {
+		t.Fatal("GetConfig accepted a non-numeric vmid")
+	}
+	if err := client.Backup("0", "backup"); err == nil {
+		t.Fatal("Backup accepted vmid 0")
+	}
+}
+
+func TestBackup(t *testing.T) {
+	var requested bool
+	client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api2/json/nodes/pve-node/vzdump" || r.Method != http.MethodPost {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode backup: %v", err)
+		}
+		if payload["vmid"] != "100" || payload["storage"] != "backup" {
+			t.Fatalf("unexpected backup payload: %v", payload)
+		}
+		requested = true
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": "UPID"})
+	})
+
+	if err := client.Backup("100", "backup"); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if !requested {
+		t.Fatal("backup endpoint not called")
+	}
+}
+
 func TestPasswordAuth(t *testing.T) {
 	var ticketRequested, csrfChecked bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

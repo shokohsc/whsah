@@ -257,7 +257,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from "vue"
+import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue"
 import { api, API_BASE } from "./api"
 
 const loginUrl = API_BASE + "/auth/login"
@@ -389,6 +389,8 @@ onMounted(() => {
   load()
 })
 
+let heartbeat = null
+
 async function play(g) {
   error.value = ""
   msg.value = ""
@@ -396,13 +398,21 @@ async function play(g) {
     const s = await api("/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ game_id: g.id, vm_id: String(g.id) }),
+      body: JSON.stringify({ game_id: g.id }),
     })
     msg.value = "Session created: " + s.vm_id
+    if (heartbeat) clearInterval(heartbeat)
+    heartbeat = setInterval(() => {
+      api("/sessions/" + s.id + "/heartbeat", { method: "POST" }).catch(() => {})
+    }, 5 * 60 * 1000)
   } catch (e) {
     error.value = e.message
   }
 }
+
+onBeforeUnmount(() => {
+  if (heartbeat) clearInterval(heartbeat)
+})
 
 async function applyOverride() {
   error.value = ""

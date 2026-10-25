@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -261,8 +262,22 @@ type Config struct {
 	Size   int `json:"size"`   // GiB (scsi0 size)
 }
 
+// validateVMID accepts only a positive decimal VM id, so a caller-supplied
+// value can never add path segments or query parameters.
+func validateVMID(vmid string) (string, error) {
+	n, err := strconv.Atoi(vmid)
+	if err != nil || n <= 0 {
+		return "", fmt.Errorf("invalid vmid %q", vmid)
+	}
+	return strconv.Itoa(n), nil
+}
+
 // GetConfig fetches a VM's configuration.
 func (c *Client) GetConfig(vmid string) (Config, error) {
+	vmid, err := validateVMID(vmid)
+	if err != nil {
+		return Config{}, err
+	}
 	var cfg Config
 	body, err := c.req(http.MethodGet, fmt.Sprintf("/api2/json/nodes/%s/qemu/%s/config", c.node, vmid), nil)
 	if err != nil {
@@ -298,6 +313,9 @@ func (c *Client) Clone(template int, name string, cores, memoryMiB, diskGiB int,
 		return 0, err
 	}
 	vmid := res.Data.Vmid
+	if vmid <= 0 {
+		return 0, fmt.Errorf("proxmox clone returned invalid vmid %d", vmid)
+	}
 
 	config := map[string]any{}
 	if cores > 0 {
@@ -330,16 +348,47 @@ func sizeSpec(giB int) string {
 }
 
 func (c *Client) Start(vmid string) error {
-	_, err := c.req(http.MethodPost, fmt.Sprintf("/api2/json/nodes/%s/qemu/%s/status/start", c.node, vmid), nil)
+	vmid, err := validateVMID(vmid)
+	if err != nil {
+		return err
+	}
+	_, err = c.req(http.MethodPost, fmt.Sprintf("/api2/json/nodes/%s/qemu/%s/status/start", c.node, vmid), nil)
 	return err
 }
 
 func (c *Client) Stop(vmid string) error {
-	_, err := c.req(http.MethodPost, fmt.Sprintf("/api2/json/nodes/%s/qemu/%s/status/stop", c.node, vmid), nil)
+	vmid, err := validateVMID(vmid)
+	if err != nil {
+		return err
+	}
+	_, err = c.req(http.MethodPost, fmt.Sprintf("/api2/json/nodes/%s/qemu/%s/status/stop", c.node, vmid), nil)
 	return err
 }
 
 func (c *Client) Delete(vmid string) error {
-	_, err := c.req(http.MethodDelete, fmt.Sprintf("/api2/json/nodes/%s/qemu/%s", c.node, vmid), nil)
+	vmid, err := validateVMID(vmid)
+	if err != nil {
+		return err
+	}
+	_, err = c.req(http.MethodDelete, fmt.Sprintf("/api2/json/nodes/%s/qemu/%s", c.node, vmid), nil)
+	return err
+}
+
+// Backup starts a vzdump task. shortcut: completion is not polled; a 2xx only
+// means Proxmox accepted the task. Upgrade to task-status polling if a failed
+// async backup must not count as a successful backup.
+func (c *Client) Backup(vmid, storage string) error {
+	vmid, err := validateVMID(vmid)
+	if err != nil {
+		return err
+	}
+	if storage == "" {
+		return fmt.Errorf("backup storage not configured")
+	}
+	_, err = c.req(http.MethodPost, fmt.Sprintf("/api2/json/nodes/%s/vzdump", c.node), map[string]any{
+		"vmid":    vmid,
+		"storage": storage,
+		"mode":    "snapshot",
+	})
 	return err
 }

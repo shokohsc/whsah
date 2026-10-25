@@ -60,6 +60,19 @@ func TestMultiFansOutToEveryHandler(t *testing.T) {
 	}
 }
 
+func TestRedact(t *testing.T) {
+	in := `GET https://api.example/games?title=Hades&key=SECRET123: 500 boom password=hunter2`
+	out := Redact(in)
+	for _, secret := range []string{"SECRET123", "hunter2", "title=Hades"} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("Redact left %q in %q", secret, out)
+		}
+	}
+	if !strings.Contains(out, "REDACTED") {
+		t.Fatalf("Redact did not mark anything: %q", out)
+	}
+}
+
 func TestLevelFiltersLowerRecords(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(Multi(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))

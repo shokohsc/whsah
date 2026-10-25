@@ -39,9 +39,10 @@ type providerMetadata struct {
 
 // Identity is the authenticated user derived from an OIDC ID token.
 type Identity struct {
-	Subject  string
-	Email    string
-	Username string
+	Subject       string
+	Email         string
+	EmailVerified bool
+	Username      string
 }
 
 // Verifier validates OIDC ID tokens against the provider's JWKS endpoint.
@@ -101,12 +102,13 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Identity, error) {
 	if iss != v.issuer {
 		return Identity{}, fmt.Errorf("issuer mismatch: %q != %q", iss, v.issuer)
 	}
-	if v.clientID != "" {
-		// "aud" is a string or an array of strings, depending on the provider.
-		aud, err := claims.GetAudience()
-		if err != nil || !slices.Contains(aud, v.clientID) {
-			return Identity{}, fmt.Errorf("audience mismatch")
-		}
+	if v.clientID == "" {
+		return Identity{}, fmt.Errorf("oidc client id not configured")
+	}
+	// "aud" is a string or an array of strings, depending on the provider.
+	aud, err := claims.GetAudience()
+	if err != nil || !slices.Contains(aud, v.clientID) {
+		return Identity{}, fmt.Errorf("audience mismatch")
 	}
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
@@ -115,6 +117,12 @@ func (v *Verifier) Verify(ctx context.Context, token string) (Identity, error) {
 	id := Identity{Subject: sub}
 	id.Email, _ = claims["email"].(string)
 	id.Username, _ = claims["preferred_username"].(string)
+	switch verified := claims["email_verified"].(type) {
+	case bool:
+		id.EmailVerified = verified
+	case string:
+		id.EmailVerified = verified == "true"
+	}
 	return id, nil
 }
 

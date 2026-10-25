@@ -209,7 +209,7 @@ func (s *Service) finish(ctx context.Context, job *models.GameJob, result string
 	updates := map[string]any{"result": result}
 	if err != nil {
 		updates["status"] = models.JobStatusFailed
-		updates["error"] = err.Error()
+		updates["error"] = logging.Redact(err.Error())
 		s.logger.Error("job failed", "job_id", job.ID, "game_id", job.GameID, "kind", job.Kind, "attempt", job.Attempts, "err", logging.SafeError(err))
 	} else {
 		updates["status"] = models.JobStatusDone
@@ -261,7 +261,7 @@ func (s *Service) applyMetadata(ctx context.Context, game *models.Game) (string,
 	s.logger.Debug("metadata fetched", "game_id", game.ID, "bytes", len(meta))
 	updates := map[string]any{"metadata": meta}
 	var parsed metadata.Metadata
-	if err := json.Unmarshal([]byte(meta), &parsed); err == nil && parsed.PEGIRating != "" {
+	if err := json.Unmarshal([]byte(meta), &parsed); err == nil && models.ValidPEGIRating(parsed.PEGIRating) {
 		updates["pegi_rating"] = parsed.PEGIRating
 	}
 	if err := s.db.WithContext(ctx).Model(&models.Game{}).Where("id = ?", game.ID).Updates(updates).Error; err != nil {
@@ -269,7 +269,6 @@ func (s *Service) applyMetadata(ctx context.Context, game *models.Game) (string,
 	}
 	return meta, nil
 }
-
 
 // defaultPEGIRating is the rating a game discovered in the library gets until
 // an admin sets the real one: the strictest rating keeps it out of reach.

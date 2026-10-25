@@ -74,8 +74,16 @@ func main() {
 	if v := os.Getenv("VDI_KUBECONFIG"); v != "" {
 		cfg.Kubeconfig = v
 	}
-	if v := os.Getenv("VDI_AGENT_TOKEN"); v != "" {
-		cfg.AgentToken = v
+	if v := os.Getenv("VDI_AGENT_TOKENS"); v != "" {
+		cfg.AgentTokens = parseAgentTokens(v)
+	}
+	if v := os.Getenv("VDI_VM_TEMPLATE_ID"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.VMTemplateID = n
+		}
+	}
+	if v := os.Getenv("VDI_BACKUP_STORAGE"); v != "" {
+		cfg.BackupStorage = v
 	}
 	if v := os.Getenv("VDI_FRONTEND_ORIGIN"); v != "" {
 		cfg.FrontendOrigin = v
@@ -142,16 +150,27 @@ func main() {
 		}
 	}
 
-	oidc := server.OIDC{
-		Issuer:   os.Getenv("VDI_OIDC_ISSUER"),
-		ClientID: os.Getenv("VDI_OIDC_CLIENT_ID"),
+	issuer := os.Getenv("VDI_OIDC_ISSUER")
+	clientID := os.Getenv("VDI_OIDC_CLIENT_ID")
+	if issuer == "" && os.Getenv("VDI_DEV_MODE") != "true" {
+		logger.Error("VDI_OIDC_ISSUER is required; set VDI_DEV_MODE=true only for local development")
+		os.Exit(1)
 	}
-	verifier := server.NewVerifier(oidc)
+	if issuer != "" && clientID == "" {
+		logger.Error("VDI_OIDC_CLIENT_ID is required when VDI_OIDC_ISSUER is set")
+		os.Exit(1)
+	}
+	verifier := server.NewVerifier(server.OIDC{Issuer: issuer, ClientID: clientID})
 
 	srv := server.New(gormDB, verifier, px, cfg).WithLogger(logger)
 
-	// Backup scheduler + VM deletion delay (runs in the server).
-	go backup.New(gormDB, px, cfg).WithLogger(logger).Run(context.Background())
+	// Backup scheduler + VM deletion delay. Without Proxmox there is nothing
+	// to back up or delete.
+	if px != nil {
+		go backup.New(gormDB, px, cfg).WithLogger(logger).Run(context.Background())
+	} else {
+		logger.Warn("backup scheduler disabled: proxmox not configured")
+	}
 
 	_ = kube // Talos node cordon/drain/delete invoked by admin flows.
 
@@ -173,4 +192,17 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)
+}
+
+// parseAgentTokens parses VDI_AGENT_TOKENS: "vmid=token,vmid=token".
+func parseAgentTokens(s string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if !ok || k == "" || v == "" {
+			continue
+		}
+		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return out
 }

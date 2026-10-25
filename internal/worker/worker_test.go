@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,6 +177,28 @@ func TestProcessMetadataFailure(t *testing.T) {
 	}
 	if failed.Error != "source down" {
 		t.Fatalf("unexpected error text: %q", failed.Error)
+	}
+}
+
+func TestProcessMetadataFailureRedactsCredentials(t *testing.T) {
+	db := testDB(t)
+	db.Create(&models.Game{Title: "Kids Game", PEGIRating: "3", LibraryPath: "/smb/kids"})
+	svc := New(db, &fakeFetcher{err: errors.New("GET https://api.example/games?apikey=SECRET failed")}, time.Millisecond)
+
+	job, err := Enqueue(db, 1, models.JobKindMetadata, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := svc.tick(context.Background()); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	var failed models.GameJob
+	if err := db.First(&failed, job.ID).Error; err != nil {
+		t.Fatalf("job: %v", err)
+	}
+	if strings.Contains(failed.Error, "SECRET") {
+		t.Fatalf("credential leaked into job error: %q", failed.Error)
 	}
 }
 

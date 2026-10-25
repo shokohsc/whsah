@@ -60,8 +60,9 @@ metadata:
     component: server
 type: Opaque
 stringData:
-  # VDI_AGENT_TOKEN — shared bearer token agents send to /agent/vm/*
-  agent-token: "<CHANGE_ME>"
+  # VDI_AGENT_TOKENS — per-VM bearer tokens: "vmid=token,vmid=token".
+  # A token only authorizes the VM id it is listed against.
+  agent-tokens: "100=<CHANGE_ME>"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -84,6 +85,10 @@ data:
   VDI_OIDC_CLIENT_ID: "vdi-server"
   VDI_BACKUP_INTERVAL: "168h"
   VDI_VM_DELETION_DELAY: "720h"
+  # Set the Proxmox template id to enable session provisioning (0 disables).
+  VDI_VM_TEMPLATE_ID: "0"
+  # Set a Proxmox storage to enable backups/VM deletion (empty disables).
+  VDI_BACKUP_STORAGE: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -182,11 +187,21 @@ spec:
                 configMapKeyRef:
                   name: vdi-config
                   key: VDI_VM_DELETION_DELAY
-            - name: VDI_AGENT_TOKEN
+            - name: VDI_VM_TEMPLATE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_VM_TEMPLATE_ID
+            - name: VDI_BACKUP_STORAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: vdi-config
+                  key: VDI_BACKUP_STORAGE
+            - name: VDI_AGENT_TOKENS
               valueFrom:
                 secretKeyRef:
                   name: vdi-agent
-                  key: agent-token
+                  key: agent-tokens
           resources:
             requests:
               cpu: 100m

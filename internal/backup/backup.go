@@ -17,13 +17,14 @@ import (
 type Service struct {
 	db       *gorm.DB
 	px       *proxmox.Client
+	storage  string
 	interval time.Duration
 	delay    time.Duration
 	logger   *slog.Logger
 }
 
 func New(db *gorm.DB, px *proxmox.Client, cfg config.Config) *Service {
-	return &Service{db: db, px: px, interval: cfg.BackupInterval, delay: cfg.VMDeletionDelay, logger: slog.Default()}
+	return &Service{db: db, px: px, storage: cfg.BackupStorage, interval: cfg.BackupInterval, delay: cfg.VMDeletionDelay, logger: slog.Default()}
 }
 
 // WithLogger sets the logger used by the service.
@@ -51,6 +52,9 @@ func (s *Service) Run(ctx context.Context) {
 }
 
 func (s *Service) tick() error {
+	if s.px == nil || s.storage == "" {
+		return nil
+	}
 	var sessions []models.Session
 	if err := s.db.Where("deleted_at IS NULL").Find(&sessions).Error; err != nil {
 		return err
@@ -59,25 +63,26 @@ func (s *Service) tick() error {
 	now := time.Now()
 	for i := range sessions {
 		sess := &sessions[i]
-		// Backup: increment count and refresh last-user-session heartbeat if
-		// the session is still active (treated as backed up each tick).
-		sess.Backups++
-		if err := s.db.Model(sess).Update("backups", sess.Backups).Error; err != nil {
+		// Only a successful backup may advance the count that gates deletion.
+		if err := s.px.Backup(sess.VMID, s.storage); err != nil {
 			s.logger.Error("backup failed", "session_id", sess.ID, "vm_id", sess.VMID, "err", err)
 			continue
 		}
+		sess.Backups++
+		if err := s.db.Model(sess).Update("backups", sess.Backups).Error; err != nil {
+			s.logger.Error("backup count update failed", "session_id", sess.ID, "err", err)
+			continue
+		}
 		s.logger.Debug("session backed up", "session_id", sess.ID, "vm_id", sess.VMID, "backups", sess.Backups)
-		// Deletion: once backed up and past the delay since last user session.
-		if sess.LastUserSession != nil && sess.Backups > 0 {
-			if now.After(sess.LastUserSession.Add(s.delay)) {
-				if err := s.px.Delete(sess.VMID); err != nil {
-					s.logger.Error("vm delete failed", "session_id", sess.ID, "vm_id", sess.VMID, "err", err)
-					continue
-				}
-				s.logger.Info("vm deleted", "session_id", sess.ID, "vm_id", sess.VMID)
-				if err := s.db.Delete(sess).Error; err != nil {
-					s.logger.Error("session delete failed", "session_id", sess.ID, "err", err)
-				}
+		// Deletion: once backed up and past the delay since the last heartbeat.
+		if sess.LastUserSession != nil && now.After(sess.LastUserSession.Add(s.delay)) {
+			if err := s.px.Delete(sess.VMID); err != nil {
+				s.logger.Error("vm delete failed", "session_id", sess.ID, "vm_id", sess.VMID, "err", err)
+				continue
+			}
+			s.logger.Info("vm deleted", "session_id", sess.ID, "vm_id", sess.VMID)
+			if err := s.db.Delete(sess).Error; err != nil {
+				s.logger.Error("session delete failed", "session_id", sess.ID, "err", err)
 			}
 		}
 	}

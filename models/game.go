@@ -30,6 +30,23 @@ type Game struct {
 	PEGIRating string `gorm:"not null" json:"pegi_rating"`
 }
 
+// pegiFloors maps a PEGI rating to its minimum age. Unknown ratings have no
+// floor and are denied by the server.
+var pegiFloors = map[string]int{"3": 3, "7": 7, "12": 12, "16": 16, "18": 18}
+
+// ValidPEGIRating reports whether s is one of the five PEGI ratings.
+func ValidPEGIRating(s string) bool {
+	_, ok := pegiFloors[s]
+	return ok
+}
+
+// PEGIFloor returns the minimum age for a PEGI rating. The second result is
+// false for an unknown rating.
+func PEGIFloor(s string) (int, bool) {
+	floor, ok := pegiFloors[s]
+	return floor, ok
+}
+
 // SanitizedName returns the cleaned game name used for metadata lookups.
 func (g *Game) SanitizedName() string {
 	if g == nil {
@@ -37,4 +54,3 @@ func (g *Game) SanitizedName() string {
 	}
 	return SanitizeGameName(g.Title)
 }
-

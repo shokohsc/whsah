@@ -7,7 +7,7 @@ metadata:
     component: agent
 type: Opaque
 stringData:
-  # VDI_AGENT_TOKEN — must match the server's VDI_AGENT_TOKEN
+  # VDI_AGENT_TOKEN — this VM's token from the server's VDI_AGENT_TOKENS
   agent-token: "<CHANGE_ME>"
   # VDI_SMB_CREDS — SMB mount credentials (optional)
   smb-creds: "<CHANGE_ME>"

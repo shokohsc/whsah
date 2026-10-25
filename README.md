@@ -37,11 +37,12 @@ Server optional env vars with defaults:
 
 - `VDI_BACKUP_INTERVAL` — default `7*24h` (once per week)
 - `VDI_VM_DELETION_DELAY` — default `30*24h` after `last_user_session` (1 month)
-- `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider (empty issuer = dev mode, accepts any bearer token). Endpoints are read from the provider's discovery document (`{issuer}/.well-known/openid-configuration`), so Pocket ID, Keycloak, Authentik, ... all work.
+- `VDI_OIDC_ISSUER`, `VDI_OIDC_CLIENT_ID` — OIDC provider; both are required. Endpoints are read from the provider's discovery document (`{issuer}/.well-known/openid-configuration`), so Pocket ID, Keycloak, Authentik, ... all work.
+- `VDI_DEV_MODE` — `true` only for local development; allows an empty `VDI_OIDC_ISSUER` and accepts any non-empty bearer token.
 - `VDI_OIDC_PUBLIC_URL` — public API base URL used to build the OIDC redirect URI (default `https://api.domain.tld`; must match `VDI_OIDC_PUBLIC_URL`/auth/callback registered at the provider)
 - `VDI_OIDC_CLIENT_SECRET` — OIDC confidential client secret (optional)
 - `VDI_FRONTEND_ORIGIN` — frontend origin allowed by CORS and used as the login redirect target (default `https://domain.tld`)
-- `VDI_ADMIN_SUBJECTS` — comma-separated OIDC subjects, usernames or emails provisioned (or promoted) to `admin` on login
+- `VDI_ADMIN_SUBJECTS` — comma-separated OIDC `sub` values provisioned (or promoted) to `admin` on login; removing one demotes an env-promoted admin
 - `VDI_DEFAULT_AGE` — age assigned to first-time users (default `18`)
 - `VDI_LISTEN_ADDR` — default `:8080`
 - `VDI_IDLE_SECS` — agent idle shutdown in seconds (default `1800`)
@@ -53,7 +54,9 @@ Server optional env vars with defaults:
 - `VDI_LOKI_URL` — remote Loki endpoint for agent logs (empty = disabled)
 - `VDI_KUBERNETES_MODE` — `auto` (default), `incluster`, or `outofcluster`
 - `VDI_KUBECONFIG` — kubeconfig path (out-of-cluster mode)
-- `VDI_AGENT_TOKEN` — shared bearer token agents use to authenticate to the server
+- `VDI_AGENT_TOKENS` — per-VM agent tokens, `vmid=token,vmid=token`. A token only authorizes its own VM id
+- `VDI_VM_TEMPLATE_ID` — Proxmox template cloned for each game session (0 disables provisioning)
+- `VDI_BACKUP_STORAGE` — Proxmox storage for vzdump backups; empty disables backups and VM deletion
 - `VDI_LOG_LEVEL` — log level for all binaries: `debug`, `info` (default), `warn`, `error`. Logs are JSON on stdout.
 
 Agent env vars:
@@ -63,7 +66,7 @@ Agent env vars:
 - `VDI_GAME_LIB` — game library path (falls back to `VDI_LIBRARY_PATH`)
 - `VDI_SMB_SHARE`, `VDI_SMB_CREDS` — SMB share + credentials (optional mount)
 - `VDI_IDLE_SECS` — idle shutdown seconds (default 1800)
-- `VDI_AGENT_TOKEN` — bearer token sent to server agent endpoints
+- `VDI_AGENT_TOKEN` — this VM's token from the server's `VDI_AGENT_TOKENS`
 - `VDI_LOKI_URL` — remote Loki endpoint for agent logs (optional)
 
 Worker env vars (`cmd/worker`):
@@ -110,9 +113,9 @@ VDI_OIDC_CLIENT_SECRET=<client secret>
 VDI_OIDC_PUBLIC_URL=https://api.domain.tld
 ```
 
-3. List an admin in `VDI_ADMIN_SUBJECTS` — the Pocket ID user name or email works, the `sub` claim is the opaque user ID.
+3. List an admin in `VDI_ADMIN_SUBJECTS` using the OIDC `sub` claim (the opaque user ID). Usernames and emails are not accepted because they can change.
 
-The scopes requested are `openid email profile`; Pocket ID puts `preferred_username` (the user name) and `email` into the ID token, and the server uses them for the user name and email address.
+The scopes requested are `openid email profile`; Pocket ID puts `preferred_username` (the user name) and `email` into the ID token. The server uses the immutable `sub` claim as the identity key and stores the email only when `email_verified` is true.
 
 ## Kubernetes deployment
 
@@ -166,7 +169,7 @@ All tables get `created_at` and `updated_at` (soft-deletable tables also `delete
 The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yaml`), not at a `domain.tld/api` path prefix. The frontend derives the API base URL at runtime from the domain it is served from (`api.<host>`), so one image works on any domain.
 
 - `GET /auth/login` — redirects to the OIDC provider (dev mode: straight back to the frontend `/login` route with a token); `GET /auth/callback` completes the flow and returns the ID token to the frontend
-- `GET/POST /games` — `PUT /games/{id}` (admin) updates `library_path`
+- `GET/POST /games` — `GET` filters by the caller's age (anonymous sees PEGI 3) and only admins receive `library_path`; `PUT /games/{id}` (admin) updates `library_path`
 - `PUT /users/{id}` (admin) — change a user's `role` (`anonymous` / `gamer` / `admin`)
 - `POST /games/{id}/jobs` (admin) — enqueue a game job (`kind`: `config` or `metadata`, optional `payload`); returns `202` with the queued job
 - `POST /library/jobs` (admin) — start the workers on the game files in the library; returns `202` with the queued `library` job
@@ -174,7 +177,7 @@ The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yam
 - `DELETE /library/paths/{id}` (admin) — remove a configured game directory
 - `DELETE /library` (admin) — reset the library: delete all games and queued jobs, keeping the configured paths
 - `GET /games/{id}/jobs` (admin) — list a game's jobs
-- `GET /jobs/{id}` — poll a job's `status`, `result`, `error`
+- `GET /jobs/{id}` (admin) — poll a job's `status`, `result`, `error`; credentials in errors are redacted
 - `GET /me` — current user id/username/role/age
 - `GET/POST/DELETE /sessions`
 - `POST /sessions/{id}/override` — VM config override
@@ -182,7 +185,7 @@ The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yam
 - `GET /config`
 - `GET /health`
 - `POST /admin/vms` (admin) — clone a Proxmox template with `template_id`, `name`, `cpu_cores`, `ram_size` (MB), `disk_size` (GB) and `vgpu` (`std`, `cirrus`, `vmware`, `qxl`, `virtio`, `none`); returns `201` with the new `vmid`
-- `POST /agent/vm/{vmid}/start`, `POST /agent/vm/{vmid}/stop`, `GET /agent/vm/{vmid}/config` (agent token auth)
+- `POST /agent/vm/{vmid}/start`, `POST /agent/vm/{vmid}/stop`, `GET /agent/vm/{vmid}/config` (per-VM agent token auth)
 
 ## Game job queue
 
@@ -222,11 +225,11 @@ When no paths are configured, `library` jobs fall back to `VDI_LIBRARY_PATH`. Th
 
 ## Security model
 
-- OIDC/JWKS verification; empty `VDI_OIDC_ISSUER` = dev-only mode that accepts any bearer token. Do not ship with it empty.
-- First login provisions the user as `gamer` (age `VDI_DEFAULT_AGE`); identities (subject, user name or email) listed in `VDI_ADMIN_SUBJECTS` are provisioned — or promoted — to `admin`
+- OIDC/JWKS verification with audience checks; the server refuses to start without `VDI_OIDC_ISSUER` and `VDI_OIDC_CLIENT_ID`. `VDI_DEV_MODE=true` is local-development only.
+- First login provisions the user as `gamer` (age `VDI_DEFAULT_AGE`); OIDC `sub` values listed in `VDI_ADMIN_SUBJECTS` are provisioned — or promoted — to `admin`, and demoted when removed
 - CORS allows only `VDI_FRONTEND_ORIGIN`
 - RBAC middleware (anonymous/gamer/admin)
-- Agent token auth (`Bearer VDI_AGENT_TOKEN`) on `/agent/vm/*` endpoints — agents never talk to Proxmox directly
+- Per-VM agent token auth (`Bearer VDI_AGENT_TOKEN`) on `/agent/vm/*`; a token only controls its own VM. Agents never talk to Proxmox directly
 - PEGI age gating
 - mTLS server↔agent
 - SMB mount `nosuid,noexec`
@@ -239,7 +242,7 @@ When no paths are configured, `library` jobs fall back to `VDI_LIBRARY_PATH`. Th
 - `server` binary at repo root is a build artifact; gitignored along with `web/node_modules` and `web/dist`.
 - Frontend build output goes to `web/dist`; do not commit it.
 - No local DB is available, so integration tests cannot run without `VDI_DATABASE_DSN`.
-- Empty `VDI_OIDC_ISSUER` disables real OIDC verification (dev-only). Do not ship with it empty.
+- Empty `VDI_OIDC_ISSUER` is only accepted with `VDI_DEV_MODE=true`; the server refuses to start otherwise. Never ship with dev mode on.
 - The OIDC provider must serve a discovery document at `{VDI_OIDC_ISSUER}/.well-known/openid-configuration`; login and token verification fail without it.
 - When running the server in Kubernetes with `VDI_KUBERNETES_MODE=incluster`, the pod's ServiceAccount needs RBAC to list/patch Talos nodes.
 - Every agent–VM interaction on the Proxmox side goes through the server (`/agent/vm/*`); agents must not call Proxmox directly.

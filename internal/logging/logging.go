@@ -10,8 +10,21 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 )
+
+var (
+	credentialRE = regexp.MustCompile(`(?i)(api[_-]?key|token|secret|password|passwd|key)=([^&\s"']+)`)
+	urlQueryRE   = regexp.MustCompile(`\?[^\s"']+`)
+)
+
+// Redact removes credentials and query strings from an error string before it
+// is persisted or returned to a client.
+func Redact(s string) string {
+	s = credentialRE.ReplaceAllString(s, `$1=REDACTED`)
+	return urlQueryRE.ReplaceAllString(s, "?REDACTED")
+}
 
 // LevelEnv is the environment variable holding the minimum log level.
 const LevelEnv = "VDI_LOG_LEVEL"

@@ -110,8 +110,15 @@ type Config struct {
 	// Kubeconfig is the path to a kubeconfig file (out-of-cluster mode).
 	Kubeconfig string
 
-	// AgentToken is the shared token agents use to authenticate to the server.
-	AgentToken string
+	// VMTemplateID is the Proxmox template cloned for each game session.
+	// Zero disables session provisioning.
+	VMTemplateID int
+	// BackupStorage is the Proxmox storage used for vzdump backups. Empty
+	// disables automatic backups and VM deletion.
+	BackupStorage string
+	// AgentTokens maps a VM id to the token its agent must present. A token is
+	// only valid for its own VM.
+	AgentTokens map[string]string
 
 	// FrontendOrigin is the browser origin allowed by CORS to call the API
 	// (empty disables CORS).

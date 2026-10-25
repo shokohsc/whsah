@@ -193,7 +193,7 @@ func TestAgeAllowed(t *testing.T) {
 		{18, "18", true},
 		{50, "3", true},
 		{1, "18", false},
-		{99, "unknown", true}, // unknown rating -> floor 0 -> allowed
+		{99, "unknown", false}, // unknown rating -> denied
 	}
 	for _, c := range cases {
 		if got := ageAllowed(c.age, c.pegi); got != c.want {
