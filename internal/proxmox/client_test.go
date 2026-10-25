@@ -57,21 +57,50 @@ func TestGetConfig(t *testing.T) {
 }
 
 func TestClone(t *testing.T) {
+	var configured, resized bool
 	client := testServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api2/json/nodes/pve-node/qemu/9000/clone" {
-			http.Error(w, "bad path", http.StatusNotFound)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"vmid": 100}})
+		switch r.URL.Path {
+		case "/api2/json/nodes/pve-node/qemu/9000/clone":
+			if r.Method != http.MethodPost {
+				http.Error(w, "bad method", http.StatusMethodNotAllowed)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"vmid": 100}})
+		case "/api2/json/nodes/pve-node/qemu/100/config":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode config: %v", err)
+			}
+			if payload["cores"] != float64(2) || payload["memory"] != float64(4096) || payload["vga"] != "virtio" {
+				t.Fatalf("unexpected config: %v", payload)
+			}
+			configured = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": nil})
+		case "/api2/json/nodes/pve-node/qemu/100/resize":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode resize: %v", err)
+			}
+			if payload["disk"] != "scsi0" || payload["size"] != "64G" {
+				t.Fatalf("unexpected resize: %v", payload)
+			}
+			resized = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": nil})
+		default:
+			http.Error(w, "bad path", http.StatusNotFound)
+		}
 	})
 
-	vmid, err := client.Clone(9000, "clone-vm", 2, 4096, 64)
+	vmid, err := client.Clone(9000, "clone-vm", 2, 4096, 64, "virtio")
 	if err != nil {
 		t.Fatalf("clone: %v", err)
 	}
 	if vmid != 100 {
 		t.Fatalf("expected vmid 100, got %d", vmid)
+	}
+	if !configured || !resized {
+		t.Fatalf("configured=%v resized=%v", configured, resized)
 	}
 }
 
@@ -133,8 +162,8 @@ func TestPasswordAuth(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]string{
-				"ticket":               "test-ticket",
-				"CSRFPreventionToken":  "test-csrf",
+				"ticket":              "test-ticket",
+				"CSRFPreventionToken": "test-csrf",
 			}})
 		case "/api2/json/nodes/pve-node/qemu":
 			csrfChecked = r.Header.Get("Cookie") == "PVEAuthCookie=test-ticket"

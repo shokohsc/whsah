@@ -114,8 +114,8 @@ func (c *Client) ensureTicket() error {
 	}
 	var res struct {
 		Data struct {
-			Ticket               string `json:"ticket"`
-			CSRFPreventionToken  string `json:"CSRFPreventionToken"`
+			Ticket              string `json:"ticket"`
+			CSRFPreventionToken string `json:"CSRFPreventionToken"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &res); err != nil {
@@ -255,10 +255,10 @@ func (c *Client) ListVMs() ([]VM, error) {
 
 // Config is a VM's configuration.
 type Config struct {
-	Vmid   int    `json:"vmid"`
-	Cores  int    `json:"cores"`
-	Memory int    `json:"memory"` // MiB
-	Size   int    `json:"size"`   // GiB (scsi0 size)
+	Vmid   int `json:"vmid"`
+	Cores  int `json:"cores"`
+	Memory int `json:"memory"` // MiB
+	Size   int `json:"size"`   // GiB (scsi0 size)
 }
 
 // GetConfig fetches a VM's configuration.
@@ -284,12 +284,11 @@ type idResp struct {
 	} `json:"data"`
 }
 
-// Clone creates a VM by cloning a template and applying cpu/mem/disk.
-func (c *Client) Clone(template int, name string, cores, memoryMiB, diskGiB int) (int, error) {
+// Clone creates a VM by cloning a template and applying cpu/mem/disk/vGPU.
+// vgpu is a Proxmox VGA type (std, cirrus, vmware, qxl, virtio or none).
+func (c *Client) Clone(template int, name string, cores, memoryMiB, diskGiB int, vgpu string) (int, error) {
 	body, err := c.req(http.MethodPost, fmt.Sprintf("/api2/json/nodes/%s/qemu/%d/clone", c.node, template), map[string]any{
-		"name":   name,
-		"cores":  cores,
-		"memory": memoryMiB,
+		"name": name,
 	})
 	if err != nil {
 		return 0, err
@@ -299,10 +298,28 @@ func (c *Client) Clone(template int, name string, cores, memoryMiB, diskGiB int)
 		return 0, err
 	}
 	vmid := res.Data.Vmid
-	// Apply disk size via config update.
+
+	config := map[string]any{}
+	if cores > 0 {
+		config["cores"] = cores
+	}
+	if memoryMiB > 0 {
+		config["memory"] = memoryMiB
+	}
+	if vgpu != "" {
+		config["vga"] = vgpu
+	}
+	if len(config) > 0 {
+		if _, err := c.req(http.MethodPut, fmt.Sprintf("/api2/json/nodes/%s/qemu/%d/config", c.node, vmid), config); err != nil {
+			return 0, fmt.Errorf("configure vm %d: %w", vmid, err)
+		}
+	}
 	if diskGiB > 0 {
-		if _, err := c.req(http.MethodPut, fmt.Sprintf("/api2/json/nodes/%s/qemu/%d/config", c.node, vmid), map[string]any{"scsi0": sizeSpec(diskGiB)}); err != nil {
-			c.logger.Warn("proxmox disk resize failed", "vmid", vmid, "disk_gib", diskGiB, "err", err)
+		if _, err := c.req(http.MethodPut, fmt.Sprintf("/api2/json/nodes/%s/qemu/%d/resize", c.node, vmid), map[string]any{
+			"disk": "scsi0",
+			"size": sizeSpec(diskGiB),
+		}); err != nil {
+			return 0, fmt.Errorf("resize vm %d disk: %w", vmid, err)
 		}
 	}
 	return vmid, nil

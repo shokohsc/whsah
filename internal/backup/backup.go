@@ -43,14 +43,14 @@ func (s *Service) Run(ctx context.Context) {
 			s.logger.Info("backup scheduler stopped")
 			return
 		case <-ticker.C:
-			if err := s.tick(ctx); err != nil {
+			if err := s.tick(); err != nil {
 				s.logger.Error("backup tick failed", "err", err)
 			}
 		}
 	}
 }
 
-func (s *Service) tick(ctx context.Context) error {
+func (s *Service) tick() error {
 	var sessions []models.Session
 	if err := s.db.Where("deleted_at IS NULL").Find(&sessions).Error; err != nil {
 		return err
@@ -80,7 +80,6 @@ func (s *Service) tick(ctx context.Context) error {
 				}
 			}
 		}
-		_ = ctx
 	}
 	return nil
 }

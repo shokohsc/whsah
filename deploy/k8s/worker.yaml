@@ -32,8 +32,13 @@ metadata:
 type: Opaque
 stringData:
   VDI_RAWG_API_KEY: ""
+  VDI_NEXUSMODS_API_KEY: ""
   VDI_BROWSERLESS_TOKEN: ""
   VDI_YOUTUBE_API_KEY: ""
+  VDI_IGDB_CLIENT_ID: ""
+  VDI_IGDB_CLIENT_SECRET: ""
+  VDI_TWITCH_CLIENT_ID: ""
+  VDI_TWITCH_CLIENT_SECRET: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -57,7 +62,7 @@ spec:
     spec:
       containers:
         - name: worker
-          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi:worker
+          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi-worker
           imagePullPolicy: IfNotPresent
           env:
             - name: VDI_DATABASE_DSN
@@ -80,6 +85,11 @@ spec:
                 secretKeyRef:
                   name: vdi-worker-secrets
                   key: VDI_RAWG_API_KEY
+            - name: VDI_NEXUSMODS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-worker-secrets
+                  key: VDI_NEXUSMODS_API_KEY
             - name: VDI_BROWSERLESS_URL
               valueFrom:
                 configMapKeyRef:
@@ -100,6 +110,26 @@ spec:
                 secretKeyRef:
                   name: vdi-worker-secrets
                   key: VDI_YOUTUBE_API_KEY
+            - name: VDI_IGDB_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-worker-secrets
+                  key: VDI_IGDB_CLIENT_ID
+            - name: VDI_IGDB_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-worker-secrets
+                  key: VDI_IGDB_CLIENT_SECRET
+            - name: VDI_TWITCH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-worker-secrets
+                  key: VDI_TWITCH_CLIENT_ID
+            - name: VDI_TWITCH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vdi-worker-secrets
+                  key: VDI_TWITCH_CLIENT_SECRET
           resources:
             requests:
               cpu: 50m

@@ -45,9 +45,12 @@ Worker env vars (`cmd/worker`):
 - `VDI_LIBRARY_PATH` — legacy fallback scanned by `library` jobs when no paths are configured in the UI
 - `VDI_METADATA_URL` — custom HTTP metadata source: `GET {VDI_METADATA_URL}/games?title={title}` returns a metadata JSON body (empty = disabled)
 - `VDI_RAWG_API_KEY` — rawg.io API key (empty = RAWG disabled)
+- `VDI_NEXUSMODS_API_KEY` — Nexus Mods personal API key (empty = NexusMods disabled)
 - `VDI_BROWSERLESS_URL`, `VDI_BROWSERLESS_TOKEN` — remote browserless instance for FitGirl scraping (empty URL = FitGirl disabled)
 - `VDI_FITGIRL_SEARCH_URL` — FitGirl search endpoint with a `{query}` placeholder
 - `VDI_YOUTUBE_API_KEY` — YouTube Data API key for live streams and video replays
+- `VDI_IGDB_CLIENT_ID`, `VDI_IGDB_CLIENT_SECRET` — Twitch application credentials for IGDB metadata
+- `VDI_TWITCH_CLIENT_ID`, `VDI_TWITCH_CLIENT_SECRET` — Twitch application credentials for live streams and video replays
 - Steam and PCGamingWiki are always enabled (public APIs)
 
 Agent env vars:
@@ -64,7 +67,7 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 - All tables get `created_at`/`updated_at` (soft-deletable tables also `deleted_at`); migrations via `db.Migrate` (GORM AutoMigrate)
 
 ## Architecture boundaries
-- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), provider discovery (`/.well-known/openid-configuration`), JWT verification (JWKS), first-login provisioning + admin promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/library/jobs`, `/library/paths`, `DELETE /library`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
+- `internal/server` — OIDC login (`/auth/login`, `/auth/callback`), provider discovery (`/.well-known/openid-configuration`), JWT verification (JWKS), first-login provisioning + admin promotion, CORS, RBAC middleware, REST API (`/games`, `/games/{id}/jobs`, `/library/jobs`, `/library/paths`, `DELETE /library`, `/jobs/{id}`, `/sessions`, `/sessions/{id}/override`, `/users`, `/users/{id}`, `/config`, `/health`, `/me`, `POST /admin/vms`, `/agent/vm/{vmid}/start|stop|config`), PEGI age gating
 - `deploy/k8s/gateway.yaml` — Gateway API ListenerSet + HTTPRoute exposing the API at `api.domain.tld`; the frontend routes between the app and `/login` via a hash router (`web/src/main.js`)
 - `internal/proxmox` — VM list/get/clone/start/stop/delete; token (PVEAPIToken) or username/password (ticket+CSRF) auth
 - `internal/k8s` — Talos node cordon/drain/delete; in-cluster service account or kubeconfig auth
@@ -72,7 +75,7 @@ External infrastructure is required to run end-to-end (PostgreSQL, Proxmox clust
 - `internal/agent` — register, Kyber/Apollo streaming, Ludusavi gamesave copy, SMB mount (`nosuid,noexec`), idle shutdown, Loki logging, VM ops via server only (never direct Proxmox)
 - `internal/firewall` — ephemeral co-op pinholes with TTL
 - `internal/worker` — PostgreSQL-backed job queue: atomically claims pending game jobs (config generation, metadata retrieval, library scan) and writes results back to `Game`
-- `internal/metadata` — metadata providers (custom HTTP, RAWG, Steam, PCGamingWiki, FitGirl via browserless, YouTube) and the aggregator that cross-references/merges them; `metadata` jobs write the merged JSON to `Game.metadata` and the PEGI (or ESRB-derived PEGI) to `Game.pegi_rating`
+- `internal/metadata` — metadata providers (custom HTTP, RAWG, NexusMods, IGDB, Steam, PCGamingWiki, FitGirl via browserless, Twitch, YouTube) and the aggregator that cross-references/merges them; `metadata` jobs write the merged JSON to `Game.metadata` and the PEGI (or ESRB-derived PEGI) to `Game.pegi_rating`
 
 ## Gotchas
 - `server` binary at repo root is a build artifact; gitignored along with `web/node_modules` and `web/dist`.

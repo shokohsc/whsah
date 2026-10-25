@@ -48,7 +48,7 @@ spec:
     spec:
       containers:
         - name: agent
-          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi:agent
+          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi-agent
           imagePullPolicy: IfNotPresent
           env:
             - name: VDI_SERVER_URL

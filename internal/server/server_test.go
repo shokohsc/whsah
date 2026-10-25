@@ -909,3 +909,156 @@ func TestAccessLogRecordsRequest(t *testing.T) {
 		t.Fatalf("access log leaked query string: %s", line)
 	}
 }
+
+func TestCreateCustomVM(t *testing.T) {
+	db := testDB(t)
+	var cloned, configured, resized bool
+	pxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api2/json/nodes/pve-node/qemu/9000/clone":
+			cloned = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"vmid": 100}})
+		case "/api2/json/nodes/pve-node/qemu/100/config":
+			configured = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": nil})
+		case "/api2/json/nodes/pve-node/qemu/100/resize":
+			resized = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": nil})
+		default:
+			http.Error(w, "bad path", http.StatusNotFound)
+		}
+	}))
+	defer pxSrv.Close()
+
+	srv := New(db, NewVerifier(OIDC{}), proxmox.New(pxSrv.URL, "pve-node", "token"), config.Default())
+	r := httptest.NewRequest(http.MethodPost, "/admin/vms", reqBody(map[string]any{
+		"template_id": 9000,
+		"name":        "custom-vm",
+		"cpu_cores":   4,
+		"ram_size":    8192,
+		"disk_size":   256,
+		"vgpu":        "virtio",
+	}))
+	w := httptest.NewRecorder()
+	srv.handleCreateVM(w, r)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create vm status = %d, want 201; body=%s", w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out["vmid"] != float64(100) {
+		t.Fatalf("vmid = %v", out["vmid"])
+	}
+	if !cloned || !configured || !resized {
+		t.Fatalf("cloned=%v configured=%v resized=%v", cloned, configured, resized)
+	}
+}
+
+func TestCreateCustomVMValidation(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	valid := map[string]any{
+		"template_id": 9000,
+		"name":        "custom-vm",
+		"cpu_cores":   4,
+		"ram_size":    8192,
+		"disk_size":   256,
+		"vgpu":        "virtio",
+	}
+	cases := []struct {
+		name   string
+		mutate func(map[string]any)
+		status int
+	}{
+		{"missing template", func(m map[string]any) { delete(m, "template_id") }, http.StatusBadRequest},
+		{"invalid name", func(m map[string]any) { m["name"] = "-bad name" }, http.StatusBadRequest},
+		{"invalid cpu", func(m map[string]any) { m["cpu_cores"] = 0 }, http.StatusBadRequest},
+		{"invalid ram", func(m map[string]any) { m["ram_size"] = 128 }, http.StatusBadRequest},
+		{"invalid disk", func(m map[string]any) { m["disk_size"] = 0 }, http.StatusBadRequest},
+		{"invalid vgpu", func(m map[string]any) { m["vgpu"] = "nope" }, http.StatusBadRequest},
+		{"proxmox not configured", func(m map[string]any) {}, http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]any{}
+			for k, v := range valid {
+				body[k] = v
+			}
+			tc.mutate(body)
+			r := httptest.NewRequest(http.MethodPost, "/admin/vms", reqBody(body))
+			w := httptest.NewRecorder()
+			srv.handleCreateVM(w, r)
+			if w.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, tc.status, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestCreateVMRouteRequiresAdmin(t *testing.T) {
+	db := testDB(t)
+	seedUsers(t, db)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+
+	// no token -> 401
+	r := httptest.NewRequest(http.MethodPost, "/admin/vms", nil)
+	w := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("no token status = %d, want 401", w.Code)
+	}
+
+	// gamer -> 403
+	r = httptest.NewRequest(http.MethodPost, "/admin/vms", nil)
+	r.Header.Set("Authorization", "Bearer any")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("gamer status = %d, want 403", w.Code)
+	}
+
+	// admin -> reaches the handler (503 because Proxmox is not configured)
+	if err := db.Model(&models.User{}).Where("username = ?", "dev-user").Update("role", models.RoleAdmin).Error; err != nil {
+		t.Fatalf("promote user: %v", err)
+	}
+	r = httptest.NewRequest(http.MethodPost, "/admin/vms", reqBody(map[string]any{
+		"template_id": 9000,
+		"name":        "custom-vm",
+		"cpu_cores":   4,
+		"ram_size":    8192,
+		"disk_size":   256,
+		"vgpu":        "virtio",
+	}))
+	r.Header.Set("Authorization", "Bearer any")
+	w = httptest.NewRecorder()
+	srv.Routes().ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("admin status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestListGamesIncludesSanitizedTitle(t *testing.T) {
+	db := testDB(t)
+	if err := db.Create(&models.Game{Title: "Hades [FitGirl Repack]", PEGIRating: "12", LibraryPath: "/games/hades"}).Error; err != nil {
+		t.Fatalf("seed game: %v", err)
+	}
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Default())
+	r := httptest.NewRequest(http.MethodGet, "/games", nil)
+	w := httptest.NewRecorder()
+	srv.handleListGames(w, r)
+
+	var games []struct {
+		Title          string `json:"title"`
+		SanitizedTitle string `json:"sanitized_title"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &games); err != nil {
+		t.Fatalf("decode games: %v", err)
+	}
+	if len(games) != 1 || games[0].Title != "Hades [FitGirl Repack]" || games[0].SanitizedTitle != "Hades" {
+		t.Fatalf("unexpected games: %+v", games)
+	}
+}

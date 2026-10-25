@@ -1,7 +1,6 @@
 package backup
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -41,7 +40,7 @@ func TestBackupIncrementsCount(t *testing.T) {
 	now := time.Now()
 	s.db.Create(&models.Session{UserID: 1, GameID: 1, VMID: "vm-1", LastUserSession: &now})
 
-	if err := s.tick(testCtx()); err != nil {
+	if err := s.tick(); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
 
@@ -58,8 +57,6 @@ func TestDeletesAfterDelay(t *testing.T) {
 	s, db := testBackupService(t)
 	deleted := 0
 	// replace px with a counting server
-	old := s.px
-	_ = old
 	countSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		deleted++
 		w.WriteHeader(http.StatusOK)
@@ -70,7 +67,7 @@ func TestDeletesAfterDelay(t *testing.T) {
 	last := time.Now().Add(-2 * time.Hour) // delay is 1 hour
 	s.db.Create(&models.Session{UserID: 1, GameID: 1, VMID: "vm-del", LastUserSession: &last})
 
-	if err := s.tick(testCtx()); err != nil {
+	if err := s.tick(); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
 
@@ -99,7 +96,7 @@ func TestNoDeleteBeforeDelay(t *testing.T) {
 	last := time.Now().Add(-5 * time.Minute) // delay is 1 hour
 	s.db.Create(&models.Session{UserID: 1, GameID: 1, VMID: "vm-keep", LastUserSession: &last})
 
-	if err := s.tick(testCtx()); err != nil {
+	if err := s.tick(); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
 
@@ -114,5 +111,3 @@ func TestNoDeleteBeforeDelay(t *testing.T) {
 		t.Fatal("session should not be deleted before delay")
 	}
 }
-
-func testCtx() context.Context { return context.Background() }

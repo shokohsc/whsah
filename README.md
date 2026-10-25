@@ -71,11 +71,16 @@ Worker env vars (`cmd/worker`):
 - `VDI_LIBRARY_PATH` — legacy fallback directory scanned by `library` jobs when no paths are configured in the UI (DB-configured paths take precedence)
 - `VDI_METADATA_URL` — custom HTTP metadata source: `GET {VDI_METADATA_URL}/games?title={title}` returns a metadata JSON body (empty = disabled; checked first)
 - `VDI_RAWG_API_KEY` — rawg.io API key (empty = RAWG disabled)
+- `VDI_NEXUSMODS_API_KEY` — Nexus Mods personal API key (empty = NexusMods disabled)
 - `VDI_BROWSERLESS_URL`, `VDI_BROWSERLESS_TOKEN` — remote browserless instance used to scrape FitGirl (empty URL = FitGirl disabled)
 - `VDI_FITGIRL_SEARCH_URL` — FitGirl search endpoint; `{query}` is replaced with the URL-escaped title (default `https://fitgirl-repacks.site/?s={query}`)
 - `VDI_YOUTUBE_API_KEY` — YouTube Data API key used for live streams and video replays (empty = YouTube disabled)
+- `VDI_IGDB_CLIENT_ID`, `VDI_IGDB_CLIENT_SECRET` — Twitch application client id/secret used by IGDB (empty = IGDB disabled)
+- `VDI_TWITCH_CLIENT_ID`, `VDI_TWITCH_CLIENT_SECRET` — Twitch application client id/secret used for live streams and video replays (empty = Twitch disabled)
 
-Steam and PCGamingWiki are queried by default; they need no credentials.
+Steam and PCGamingWiki are queried by default; they need no credentials. IGDB and Twitch share the same Twitch application credentials.
+
+Additional sources from the plan are intentionally not implemented: VGDB, Kick, IGG-Games, Kaos, Dodi, Online-Fix, SensCritique and Kotaku have no stable public game-metadata API, so they would require site-specific scraping credentials/selectors. Steam reviews already cover the reviews field.
 
 Build, run, frontend:
 
@@ -112,6 +117,17 @@ The scopes requested are `openid email profile`; Pocket ID puts `preferred_usern
 ## Kubernetes deployment
 
 See `deploy/k8s/` for example YAML manifests: server Deployment + Service + ServiceAccount with RBAC for in-cluster K8s access, a Gateway API ListenerSet + HTTPRoute exposing the API at `api.domain.tld`, an example agent Deployment, and a worker Deployment that consumes the PostgreSQL game job queue. The server autodetects in-cluster auth via `KUBERNETES_SERVICE_HOST` when `VDI_KUBERNETES_MODE=auto`; set `VDI_KUBERNETES_MODE=incluster` to force service-account auth or `outofcluster` with `VDI_KUBECONFIG` to use a kubeconfig.
+
+### Live development with Skaffold
+
+Connect to a cluster or set the current context, replace `REPLACE_OWNER` in `skaffold.yaml` and `deploy/k8s/*.yaml` with your registry namespace, then:
+
+```
+skaffold dev        # watch source, rebuild server/agent/worker images, redeploy, port-forward the API
+skaffold run        # one-shot build + deploy
+```
+
+`skaffold dev` forwards `localhost:8080` to the `vdi-server` Service. Go changes rebuild and restart the affected pod. The web frontend is not part of `deploy/k8s` (there is no frontend Deployment/Service and its image is a static `scratch` image), so it is not live-synced here.
 
 Apply the server stack:
 
@@ -165,6 +181,7 @@ The API is served at the `api.domain.tld` subdomain (see `deploy/k8s/gateway.yam
 - `GET /users` (admin)
 - `GET /config`
 - `GET /health`
+- `POST /admin/vms` (admin) — clone a Proxmox template with `template_id`, `name`, `cpu_cores`, `ram_size` (MB), `disk_size` (GB) and `vgpu` (`std`, `cirrus`, `vmware`, `qxl`, `virtio`, `none`); returns `201` with the new `vmid`
 - `POST /agent/vm/{vmid}/start`, `POST /agent/vm/{vmid}/stop`, `GET /agent/vm/{vmid}/config` (agent token auth)
 
 ## Game job queue
@@ -179,18 +196,21 @@ Games are configured and enriched asynchronously through a PostgreSQL-backed que
 
 ### Metadata sources
 
-The worker merges these sources in order (custom HTTP first, then RAWG, Steam, PCGamingWiki, FitGirl, YouTube). A failing source does not fail the job as long as another source succeeds; every stored record lists its `sources` with URLs.
+The worker merges these sources in order (custom HTTP first, then RAWG, NexusMods, IGDB, Steam, PCGamingWiki, FitGirl, Twitch, YouTube). A failing source does not fail the job as long as another source succeeds; every stored record lists its `sources` with URLs.
 
 | Source | Enabled by | Fields |
 | --- | --- | --- |
 | Custom HTTP | `VDI_METADATA_URL` | already-aggregated metadata JSON |
 | RAWG | `VDI_RAWG_API_KEY` | rating, genres, tags, release date, platforms, Metacritic, developer, publisher, ESRB, video replays |
+| NexusMods | `VDI_NEXUSMODS_API_KEY` | genres, mod page URL |
+| IGDB | `VDI_IGDB_CLIENT_ID`, `VDI_IGDB_CLIENT_SECRET` | rating, genres, release date, platforms, developer, publisher, PEGI/ESRB |
 | Steam | always (public API) | genres, release date, platforms, Metacritic, PC specs, developer, publisher, PEGI/ESRB, video replays, reviews |
 | PCGamingWiki | always (public API) | genres, tags, release date, platforms, Metacritic, PC specs, developer, publisher, PEGI/ESRB |
 | FitGirl | `VDI_BROWSERLESS_URL` | genres/tags, developer, PC specs, PEGI/ESRB |
+| Twitch | `VDI_TWITCH_CLIENT_ID`, `VDI_TWITCH_CLIENT_SECRET` | live streams, video replays |
 | YouTube | `VDI_YOUTUBE_API_KEY` | live streams, video replays |
 
-Sites from `plan.md` that have no public API or require credentials/anti-bot handling (VGDB, IGDB, NexusMods, Kick, IGG-Games, Kaos, Dodi, Online-Fix, SensCritique, Kotaku) can be plugged in as additional `metadata.Provider` implementations; use the FitGirl browserless provider as the reference for rendered pages.
+Sites from `plan.md` that have no stable public game-metadata API or would need site-specific scraping credentials/selectors (VGDB, Kick, IGG-Games, Kaos, Dodi, Online-Fix, SensCritique, Kotaku) can be plugged in as additional `metadata.Provider` implementations; use the FitGirl browserless provider as the reference for rendered pages.
 
 ### Processing the library
 

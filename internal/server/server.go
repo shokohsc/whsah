@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +52,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
 	mux.HandleFunc("GET /games", s.handleListGames)
 	mux.Handle("POST /games", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateGame))))
+	mux.Handle("POST /admin/vms", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleCreateVM))))
 	mux.Handle("PUT /games/{id}", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleUpdateGame))))
 	mux.Handle("POST /games/{id}/jobs", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleEnqueueGameJob))))
 	mux.Handle("GET /games/{id}/jobs", s.auth(s.requireRole(models.RoleAdmin)(http.HandlerFunc(s.handleListGameJobs))))
@@ -336,17 +338,18 @@ func (s *Server) handleListGames(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type gameOut struct {
-		ID          uint                   `json:"id"`
-		Title       string                 `json:"title"`
-		LibraryPath string                 `json:"library_path"`
-		Category    models.LibraryCategory `json:"category"`
-		PEGIRating  string                 `json:"pegi_rating"`
-		VMConfig    models.VMConfig        `json:"vm_config"`
-		Metadata    string                 `json:"metadata"`
+		ID             uint                   `json:"id"`
+		Title          string                 `json:"title"`
+		SanitizedTitle string                 `json:"sanitized_title"`
+		LibraryPath    string                 `json:"library_path"`
+		Category       models.LibraryCategory `json:"category"`
+		PEGIRating     string                 `json:"pegi_rating"`
+		VMConfig       models.VMConfig        `json:"vm_config"`
+		Metadata       string                 `json:"metadata"`
 	}
 	out := make([]gameOut, len(games))
 	for i, g := range games {
-		out[i] = gameOut{ID: g.ID, Title: g.Title, LibraryPath: g.LibraryPath, Category: g.Category, PEGIRating: g.PEGIRating, VMConfig: g.VMConfig, Metadata: g.Metadata}
+		out[i] = gameOut{ID: g.ID, Title: g.Title, SanitizedTitle: g.SanitizedName(), LibraryPath: g.LibraryPath, Category: g.Category, PEGIRating: g.PEGIRating, VMConfig: g.VMConfig, Metadata: g.Metadata}
 	}
 	s.writeJSON(w, http.StatusOK, out)
 }
@@ -368,6 +371,70 @@ func (s *Server) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Info("game created", "game_id", g.ID, "title", g.Title, "pegi_rating", g.PEGIRating)
 	s.writeJSON(w, http.StatusCreated, g)
+}
+
+var (
+	vmNameRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,63}$`)
+	vmVGAs   = map[string]bool{"": true, "std": true, "cirrus": true, "vmware": true, "qxl": true, "virtio": true, "none": true}
+)
+
+// handleCreateVM clones a Proxmox template with an admin-chosen CPU, RAM,
+// disk size and VGA type, then returns the new VM id.
+func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TemplateID int    `json:"template_id"`
+		Name       string `json:"name"`
+		CPUCores   int    `json:"cpu_cores"`
+		RAMSize    int    `json:"ram_size"`
+		DiskSize   int    `json:"disk_size"`
+		VGPU       string `json:"vgpu"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.VGPU = strings.ToLower(strings.TrimSpace(req.VGPU))
+	switch {
+	case req.TemplateID <= 0:
+		http.Error(w, `{"error":"template_id required"}`, http.StatusBadRequest)
+		return
+	case !vmNameRE.MatchString(req.Name):
+		http.Error(w, `{"error":"name must start with a letter and contain only letters, digits and hyphens"}`, http.StatusBadRequest)
+		return
+	case req.CPUCores < 1 || req.CPUCores > 128:
+		http.Error(w, `{"error":"cpu_cores must be between 1 and 128"}`, http.StatusBadRequest)
+		return
+	case req.RAMSize < 512 || req.RAMSize > 1048576:
+		http.Error(w, `{"error":"ram_size must be between 512 and 1048576 MB"}`, http.StatusBadRequest)
+		return
+	case req.DiskSize < 1 || req.DiskSize > 65536:
+		http.Error(w, `{"error":"disk_size must be between 1 and 65536 GB"}`, http.StatusBadRequest)
+		return
+	case !vmVGAs[req.VGPU]:
+		http.Error(w, `{"error":"invalid vgpu"}`, http.StatusBadRequest)
+		return
+	}
+	if s.px == nil {
+		http.Error(w, `{"error":"proxmox not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+	vmid, err := s.px.Clone(req.TemplateID, req.Name, req.CPUCores, req.RAMSize, req.DiskSize, req.VGPU)
+	if err != nil {
+		s.logger.Error("custom vm clone failed", "template_id", req.TemplateID, "name", req.Name, "err", logging.SafeError(err))
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadGateway)
+		return
+	}
+	s.logger.Info("custom vm created", "vm_id", vmid, "template_id", req.TemplateID, "name", req.Name, "cpu_cores", req.CPUCores, "ram_size", req.RAMSize, "disk_size", req.DiskSize, "vgpu", req.VGPU)
+	s.writeJSON(w, http.StatusCreated, map[string]any{
+		"vmid":        vmid,
+		"template_id": req.TemplateID,
+		"name":        req.Name,
+		"cpu_cores":   req.CPUCores,
+		"ram_size":    req.RAMSize,
+		"disk_size":   req.DiskSize,
+		"vgpu":        req.VGPU,
+	})
 }
 
 func (s *Server) handleUpdateGame(w http.ResponseWriter, r *http.Request) {

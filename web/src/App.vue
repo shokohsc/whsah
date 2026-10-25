@@ -128,7 +128,7 @@
           </thead>
           <tbody>
             <tr v-for="g in allGames" :key="g.id">
-              <td>{{ g.title }}</td>
+              <td>{{ displayTitle(g) }}</td>
               <td>{{ g.category || "—" }}</td>
               <td>
                 <div class="field is-grouped">
@@ -150,6 +150,41 @@
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <!-- Admin: clone a Proxmox template with custom VM specs -->
+      <div v-if="can.manageGames" class="box mt-4" :class="themeClass">
+        <h2 class="subtitle">Custom VM (admin)</h2>
+        <div class="field is-grouped is-grouped-multiline">
+          <div class="control">
+            <input class="input" type="number" v-model.number="newVM.template_id" placeholder="Template VMID" />
+          </div>
+          <div class="control is-expanded">
+            <input class="input" v-model="newVM.name" placeholder="VM name (letters, digits, hyphens)" />
+          </div>
+        </div>
+        <div class="field is-grouped is-grouped-multiline">
+          <div class="control">
+            <input class="input" type="number" v-model.number="newVM.cpu_cores" placeholder="CPU cores" />
+          </div>
+          <div class="control">
+            <input class="input" type="number" v-model.number="newVM.ram_size" placeholder="RAM (MB)" />
+          </div>
+          <div class="control">
+            <input class="input" type="number" v-model.number="newVM.disk_size" placeholder="Disk (GB)" />
+          </div>
+          <div class="control">
+            <div class="select">
+              <select v-model="newVM.vgpu">
+                <option value="">VGA: template</option>
+                <option v-for="v in vgpuOptions" :key="v" :value="v">VGA: {{ v }}</option>
+              </select>
+            </div>
+          </div>
+          <div class="control">
+            <button class="button is-primary" @click="createVM">Create VM</button>
+          </div>
+        </div>
       </div>
 
       <!-- Admin: user roles (who can play, who can administer) -->
@@ -185,10 +220,10 @@
 
       <div class="netflix-row">
         <div class="netflix-grid">
-          <div v-for="g in visibleGames" :key="g.id" class="netflix-card">
+          <div v-for="g in pagedGames" :key="g.id" class="netflix-card">
             <div class="netflix-card-inner">
               <div class="netflix-card-poster">
-                <div class="netflix-card-title">{{ g.title }}</div>
+                <div class="netflix-card-title">{{ displayTitle(g) }}</div>
               </div>
               <div class="netflix-card-info">
                 <div class="netflix-card-meta">
@@ -207,6 +242,14 @@
         </div>
       </div>
 
+      <nav v-if="pageCount > 1" class="pagination is-small netflix-pagination mt-5" role="navigation" aria-label="Game pages">
+        <button type="button" class="pagination-previous" :disabled="page <= 1" @click="page--">Previous</button>
+        <button type="button" class="pagination-next" :disabled="page >= pageCount" @click="page++">Next</button>
+        <ul class="pagination-list">
+          <li><span class="pagination-link is-current">Page {{ page }} of {{ pageCount }}</span></li>
+        </ul>
+      </nav>
+
       <div v-if="error" class="notification is-danger mt-4">{{ error }}</div>
       <div v-if="msg" class="notification is-info mt-4">{{ msg }}</div>
     </div>
@@ -214,7 +257,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from "vue"
+import { ref, computed, onMounted, watch } from "vue"
 import { api, API_BASE } from "./api"
 
 const loginUrl = API_BASE + "/auth/login"
@@ -233,6 +276,10 @@ const categories = ["repacks", "portables", "isos", "setups"]
 const newPath = ref({ category: "repacks", path: "" })
 const users = ref([])
 const newGame = ref({ title: "", pegi_rating: "", library_path: "" })
+const newVM = ref({ template_id: null, name: "", cpu_cores: 4, ram_size: 8192, disk_size: 128, vgpu: "virtio" })
+const vgpuOptions = ["std", "cirrus", "vmware", "qxl", "virtio", "none"]
+const page = ref(1)
+const pageSize = 24
 
 const roles = [
   { role: "anonymous", actions: "Browse games" },
@@ -261,10 +308,25 @@ const themeClass = computed(() => {
   return t === "dark" ? "is-dark-theme" : ""
 })
 const themeLabel = computed(() => (theme.value === "dark" ? "Light" : "Dark"))
-const visibleGames = computed(() => {
+const filteredGames = computed(() => {
   const q = query.value.toLowerCase()
-  return allGames.value.filter((g) => g.title.toLowerCase().includes(q))
+  return allGames.value.filter((g) => displayTitle(g).toLowerCase().includes(q))
 })
+const pageCount = computed(() => Math.max(1, Math.ceil(filteredGames.value.length / pageSize)))
+const pagedGames = computed(() => {
+  const start = (page.value - 1) * pageSize
+  return filteredGames.value.slice(start, start + pageSize)
+})
+watch(query, () => { page.value = 1 })
+watch(pageCount, (count) => {
+  if (page.value > count) page.value = count
+})
+
+// The server exposes the sanitized title (models.SanitizeGameName) next to the
+// raw folder/file name, so the UI never re-implements that logic.
+function displayTitle(g) {
+  return (g && (g.sanitized_title || g.title)) || ""
+}
 
 // Parse the remote-source metadata stored on the game row. Database fields
 // (title, pegi_rating, category) are only fallbacks; the catalog presents the
@@ -353,6 +415,21 @@ async function applyOverride() {
       body: JSON.stringify(body),
     })
     msg.value = "Override applied"
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+async function createVM() {
+  error.value = ""
+  msg.value = ""
+  try {
+    const vm = await api("/admin/vms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newVM.value),
+    })
+    msg.value = "VM clone #" + vm.vmid + " created"
   } catch (e) {
     error.value = e.message
   }
@@ -567,6 +644,14 @@ function logout() {
 }
 .netflix-play:hover {
   background: #f40612;
+}
+.netflix-pagination {
+  justify-content: center;
+}
+.netflix-pagination .pagination-link.is-current {
+  background: #e50914;
+  border-color: #e50914;
+  color: #fff;
 }
 
 /* Bulma dark theme support */

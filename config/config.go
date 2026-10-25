@@ -81,6 +81,8 @@ type Config struct {
 	MetadataURL string
 	// RAWGAPIKey enables the RAWG metadata provider.
 	RAWGAPIKey string
+	// NexusModsAPIKey enables the Nexus Mods metadata provider.
+	NexusModsAPIKey string
 	// BrowserlessURL is the browserless instance used to scrape FitGirl
 	// (empty = FitGirl scraping disabled).
 	BrowserlessURL string
@@ -91,9 +93,17 @@ type Config struct {
 	FitGirlSearchURL string
 	// YouTubeAPIKey enables the YouTube provider for live streams and replays.
 	YouTubeAPIKey string
-
 	// LokiURL is the remote Loki endpoint for agent logs (empty = disabled).
 	LokiURL string
+
+	// IGDBClientID and IGDBClientSecret enable the IGDB provider. IGDB uses
+	// Twitch application credentials.
+	IGDBClientID     string
+	IGDBClientSecret string
+	// TwitchClientID and TwitchClientSecret enable the Twitch provider for
+	// live streams and video replays.
+	TwitchClientID     string
+	TwitchClientSecret string
 
 	// KubernetesMode selects in-cluster vs out-of-cluster auth.
 	KubernetesMode KubernetesMode

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -395,18 +396,181 @@ func TestYouTubeProvider(t *testing.T) {
 	}
 }
 
+func TestIGDBProvider(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("parse token form: %v", err)
+			}
+			if r.Form.Get("client_id") != "id" || r.Form.Get("client_secret") != "secret" || r.Form.Get("grant_type") != "client_credentials" {
+				t.Fatalf("unexpected token form: %v", r.Form)
+			}
+			fmt.Fprint(w, `{"access_token":"token","expires_in":3600}`)
+		case "/v4/games":
+			if r.Header.Get("Client-ID") != "id" || r.Header.Get("Authorization") != "Bearer token" {
+				t.Fatalf("unexpected headers: %v", r.Header)
+			}
+			query, _ := io.ReadAll(r.Body)
+			if !strings.Contains(string(query), `search "Hades"`) {
+				t.Fatalf("unexpected query: %s", query)
+			}
+			fmt.Fprint(w, `[
+				{"name":"Hades II","url":"https://www.igdb.com/games/hades-ii"},
+				{"name":"Hades","url":"https://www.igdb.com/games/hades","rating":88,
+				 "first_release_date":1600300800,
+				 "genres":[{"name":"Role-playing (RPG)"}],
+				 "platforms":[{"name":"PC (Microsoft Windows)"}],
+				 "involved_companies":[
+					{"publisher":false,"company":{"name":"Supergiant Games"}},
+					{"publisher":true,"company":{"name":"Supergiant Games"}}
+				 ],
+				 "age_ratings":[{"category":1,"rating":5},{"category":2,"rating":3}]}
+			]`)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := &IGDBProvider{ClientID: "id", ClientSecret: "secret", BaseURL: srv.URL + "/v4", TokenURL: srv.URL + "/token"}
+	meta, err := p.Fetch(context.Background(), "Hades")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if meta.Title != "Hades" || meta.Developer != "Supergiant Games" || meta.Publisher != "Supergiant Games" {
+		t.Fatalf("unexpected metadata: %+v", meta)
+	}
+	if meta.PEGIRating != "12" || meta.ESRBRating != "T" {
+		t.Fatalf("unexpected ratings: %+v", meta)
+	}
+	if meta.ReleaseDate != "2020-09-17" || meta.Rating != 4.4 {
+		t.Fatalf("unexpected release/rating: %+v", meta)
+	}
+	if strings.Join(meta.Genres, ",") != "Role-playing (RPG)" || strings.Join(meta.Platforms, ",") != "PC (Microsoft Windows)" {
+		t.Fatalf("unexpected genres/platforms: %+v", meta)
+	}
+	if len(meta.Sources) != 1 || meta.Sources[0].Name != "IGDB" {
+		t.Fatalf("unexpected sources: %+v", meta.Sources)
+	}
+}
+
+func TestTwitchProvider(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			fmt.Fprint(w, `{"access_token":"token","expires_in":3600}`)
+			return
+		}
+		if r.Header.Get("Client-ID") != "id" || r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("unexpected headers: %v", r.Header)
+		}
+		switch r.URL.Path {
+		case "/helix/games":
+			if r.URL.Query().Get("name") != "Hades" {
+				t.Fatalf("name = %q", r.URL.Query().Get("name"))
+			}
+			fmt.Fprint(w, `{"data":[{"id":"2","name":"Hades II"},{"id":"1","name":"Hades"}]}`)
+		case "/helix/streams":
+			if r.URL.Query().Get("game_id") != "1" {
+				t.Fatalf("streams game_id = %q", r.URL.Query().Get("game_id"))
+			}
+			fmt.Fprint(w, `{"data":[{"user_login":"streamer","user_name":"Streamer"}]}`)
+		case "/helix/videos":
+			if r.URL.Query().Get("game_id") != "1" {
+				t.Fatalf("videos game_id = %q", r.URL.Query().Get("game_id"))
+			}
+			fmt.Fprint(w, `{"data":[{"id":"v1"},{"id":"v2"}]}`)
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := &TwitchProvider{ClientID: "id", ClientSecret: "secret", BaseURL: srv.URL + "/helix", TokenURL: srv.URL + "/token"}
+	meta, err := p.Fetch(context.Background(), "Hades")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if strings.Join(meta.LiveStreams, ",") != "https://www.twitch.tv/streamer" {
+		t.Fatalf("live streams = %v", meta.LiveStreams)
+	}
+	if strings.Join(meta.VideoReplays, ",") != "https://www.twitch.tv/videos/v1,https://www.twitch.tv/videos/v2" {
+		t.Fatalf("replays = %v", meta.VideoReplays)
+	}
+	if len(meta.Sources) != 1 || meta.Sources[0].Name != "Twitch" {
+		t.Fatalf("sources = %v", meta.Sources)
+	}
+}
+
+func TestIGDBRatingMappings(t *testing.T) {
+	pegi := map[int]string{1: "3", 2: "7", 3: "12", 4: "16", 5: "18", 0: ""}
+	for rating, want := range pegi {
+		if got := igdbPEGI(rating); got != want {
+			t.Fatalf("igdbPEGI(%d) = %q, want %q", rating, got, want)
+		}
+	}
+	esrb := map[int]string{2: "EC", 3: "E", 4: "E10+", 5: "T", 6: "M", 7: "AO", 0: ""}
+	for rating, want := range esrb {
+		if got := igdbESRB(rating); got != want {
+			t.Fatalf("igdbESRB(%d) = %q, want %q", rating, got, want)
+		}
+	}
+}
+
+func TestNexusModsProvider(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/games.json" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("apikey") != "secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		fmt.Fprint(w, `[
+			{"name":"Hades II","genre":"RPG","domain_name":"hades2","nexusmods_url":"https://www.nexusmods.com/hades2"},
+			{"name":"Hades","genre":"Action, Roguelike","domain_name":"hades","nexusmods_url":"https://www.nexusmods.com/hades"}
+		]`)
+	}))
+	defer srv.Close()
+
+	p := &NexusModsProvider{APIKey: "secret", BaseURL: srv.URL}
+	meta, err := p.Fetch(context.Background(), "Hades")
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if meta.Title != "Hades" {
+		t.Fatalf("title = %q", meta.Title)
+	}
+	if strings.Join(meta.Genres, ",") != "Action,Roguelike" {
+		t.Fatalf("genres = %v", meta.Genres)
+	}
+	if len(meta.Sources) != 1 || meta.Sources[0].URL != "https://www.nexusmods.com/hades" {
+		t.Fatalf("sources = %v", meta.Sources)
+	}
+}
+
 func TestBuildProviders(t *testing.T) {
 	providers := BuildProviders(Config{})
 	if len(providers) != 2 {
 		t.Fatalf("expected the two public providers, got %d", len(providers))
 	}
 	providers = BuildProviders(Config{
-		CustomURL:      "https://custom.example",
-		RAWGAPIKey:     "key",
-		BrowserlessURL: "https://browserless.example",
-		YouTubeAPIKey:  "youtube",
+		CustomURL:          "https://custom.example",
+		RAWGAPIKey:         "key",
+		NexusModsAPIKey:    "nexus",
+		BrowserlessURL:     "https://browserless.example",
+		YouTubeAPIKey:      "youtube",
+		IGDBClientID:       "igdb-id",
+		IGDBClientSecret:   "igdb-secret",
+		TwitchClientID:     "twitch-id",
+		TwitchClientSecret: "twitch-secret",
 	})
-	if len(providers) != 6 {
-		t.Fatalf("expected 6 providers, got %d", len(providers))
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 providers, got %d", len(providers))
+	}
+	providers = BuildProviders(Config{IGDBClientID: "id", TwitchClientID: "id"})
+	if len(providers) != 2 {
+		t.Fatalf("providers without secrets must stay disabled, got %d", len(providers))
 	}
 }

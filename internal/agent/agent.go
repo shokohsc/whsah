@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -237,65 +236,6 @@ func (a *Agent) ShutdownAfterInactivity(idleSecs uint) {
 		a.logger.Info("idle shutdown", "vm_id", a.vmID)
 		_ = exec.Command("systemctl", "poweroff").Run()
 	}()
-}
-
-// StartVM asks the server to start the VM on Proxmox (agent never talks to
-// Proxmox directly).
-func (a *Agent) StartVM(vmid string) error {
-	return a.vmOp(http.MethodPost, vmid, "start")
-}
-
-// StopVM asks the server to stop the VM on Proxmox.
-func (a *Agent) StopVM(vmid string) error {
-	return a.vmOp(http.MethodPost, vmid, "stop")
-}
-
-// GetVMConfig asks the server for the VM's Proxmox configuration.
-func (a *Agent) GetVMConfig(vmid string) ([]byte, error) {
-	return a.vmGet(vmid, "config")
-}
-
-func (a *Agent) vmOp(method, vmid, op string) error {
-	if a.agentToken == "" {
-		a.logger.Error("vm op rejected: no agent token", "vmid", vmid, "op", op)
-		return fmt.Errorf("no agent token")
-	}
-	req, err := http.NewRequest(http.MethodPost, a.serverURL+"/agent/vm/"+vmid+"/"+op, nil)
-	if err != nil {
-		a.logger.Error("vm op request failed", "vmid", vmid, "op", op, "err", logging.SafeError(err))
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+a.agentToken)
-	resp, err := a.client.Do(req)
-	if err != nil {
-		a.logger.Error("vm op failed", "vmid", vmid, "op", op, "err", logging.SafeError(err))
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		a.logger.Error("vm op rejected", "vmid", vmid, "op", op, "status", resp.StatusCode)
-		return fmt.Errorf("server returned %d", resp.StatusCode)
-	}
-	a.logger.Info("vm op ok", "vmid", vmid, "op", op)
-	return nil
-}
-
-func (a *Agent) vmGet(vmid, op string) ([]byte, error) {
-	if a.agentToken == "" {
-		return nil, fmt.Errorf("no agent token")
-	}
-	req, err := http.NewRequest(http.MethodGet, a.serverURL+"/agent/vm/"+vmid+"/"+op, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+a.agentToken)
-	resp, err := a.client.Do(req)
-	if err != nil {
-		a.logger.Error("vm get failed", "vmid", vmid, "op", op, "err", logging.SafeError(err))
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
 }
 
 func copyDir(src, dst string) error {

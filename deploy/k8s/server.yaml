@@ -107,7 +107,7 @@ spec:
       serviceAccountName: vdi-server
       containers:
         - name: server
-          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi:server
+          image: ghcr.io/REPLACE_OWNER/selfhosted-gaming-vdi-server
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

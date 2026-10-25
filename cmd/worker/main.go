@@ -31,6 +31,9 @@ func main() {
 	if v := os.Getenv("VDI_RAWG_API_KEY"); v != "" {
 		cfg.RAWGAPIKey = v
 	}
+	if v := os.Getenv("VDI_NEXUSMODS_API_KEY"); v != "" {
+		cfg.NexusModsAPIKey = v
+	}
 	if v := os.Getenv("VDI_BROWSERLESS_URL"); v != "" {
 		cfg.BrowserlessURL = v
 	}
@@ -42,6 +45,18 @@ func main() {
 	}
 	if v := os.Getenv("VDI_YOUTUBE_API_KEY"); v != "" {
 		cfg.YouTubeAPIKey = v
+	}
+	if v := os.Getenv("VDI_IGDB_CLIENT_ID"); v != "" {
+		cfg.IGDBClientID = v
+	}
+	if v := os.Getenv("VDI_IGDB_CLIENT_SECRET"); v != "" {
+		cfg.IGDBClientSecret = v
+	}
+	if v := os.Getenv("VDI_TWITCH_CLIENT_ID"); v != "" {
+		cfg.TwitchClientID = v
+	}
+	if v := os.Getenv("VDI_TWITCH_CLIENT_SECRET"); v != "" {
+		cfg.TwitchClientSecret = v
 	}
 
 	gormDB, err := db.Open(cfg)
@@ -55,12 +70,17 @@ func main() {
 	}
 
 	fetcher := metadata.New(metadata.BuildProviders(metadata.Config{
-		CustomURL:        cfg.MetadataURL,
-		RAWGAPIKey:       cfg.RAWGAPIKey,
-		BrowserlessURL:   cfg.BrowserlessURL,
-		BrowserlessToken: cfg.BrowserlessToken,
-		FitGirlSearchURL: cfg.FitGirlSearchURL,
-		YouTubeAPIKey:    cfg.YouTubeAPIKey,
+		CustomURL:          cfg.MetadataURL,
+		RAWGAPIKey:         cfg.RAWGAPIKey,
+		NexusModsAPIKey:    cfg.NexusModsAPIKey,
+		BrowserlessURL:     cfg.BrowserlessURL,
+		BrowserlessToken:   cfg.BrowserlessToken,
+		FitGirlSearchURL:   cfg.FitGirlSearchURL,
+		YouTubeAPIKey:      cfg.YouTubeAPIKey,
+		IGDBClientID:       cfg.IGDBClientID,
+		IGDBClientSecret:   cfg.IGDBClientSecret,
+		TwitchClientID:     cfg.TwitchClientID,
+		TwitchClientSecret: cfg.TwitchClientSecret,
 	})...)
 	fetcher.Logger = logger
 
