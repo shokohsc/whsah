@@ -18,11 +18,23 @@ func Open(cfg config.Config) (*gorm.DB, error) {
 
 // Migrate auto-migrates the main tables (users, games, sessions, game jobs).
 func Migrate(db *gorm.DB) error {
-	return db.AutoMigrate(
+	if err := db.AutoMigrate(
 		&models.User{},
 		&models.Game{},
 		&models.Session{},
 		&models.GameJob{},
 		&models.LibraryPath{},
-	)
+	); err != nil {
+		return err
+	}
+	// Older versions made provider usernames/emails unique. They are display
+	// attributes now; duplicate values must not break login.
+	for _, idx := range []string{"idx_users_username", "idx_users_email"} {
+		if db.Migrator().HasIndex(&models.User{}, idx) {
+			if err := db.Migrator().DropIndex(&models.User{}, idx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

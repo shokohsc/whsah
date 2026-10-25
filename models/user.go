@@ -24,9 +24,11 @@ type User struct {
 
 	// Subject is the OIDC "sub" claim: the immutable identity key. It is empty
 	// only for rows provisioned before subject binding existed.
-	Subject  string `gorm:"uniqueIndex:idx_users_subject,where:subject <> '';size:255" json:"-"`
-	Username string `gorm:"uniqueIndex;not null" json:"username"`
-	Email    string `gorm:"uniqueIndex;not null" json:"email"`
+	Subject string `gorm:"uniqueIndex:idx_users_subject,where:subject <> '';size:255" json:"-"`
+	// Username and Email are display attributes, not identity keys. Providers
+	// may return duplicate or mutable values, so they are not unique.
+	Username string `gorm:"not null" json:"username"`
+	Email    string `gorm:"not null" json:"email"`
 	Age      int    `gorm:"not null" json:"age"`
 	Role     Role   `gorm:"not null;default:'anonymous'" json:"role"`
 	// EnvAdmin records that the role came from VDI_ADMIN_SUBJECTS, so removing

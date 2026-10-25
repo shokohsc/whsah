@@ -857,6 +857,23 @@ func TestEnsureUserAdminDemotion(t *testing.T) {
 	}
 }
 
+func TestEnsureUserAllowsDuplicateProviderAttributes(t *testing.T) {
+	db := testDB(t)
+	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{DefaultAge: 18})
+
+	a, err := srv.ensureUser(Identity{Subject: "sub-a", Username: "alice", EmailVerified: true, Email: "shared@example.com"})
+	if err != nil {
+		t.Fatalf("ensureUser a: %v", err)
+	}
+	b, err := srv.ensureUser(Identity{Subject: "sub-b", Username: "alice", EmailVerified: true, Email: "shared@example.com"})
+	if err != nil {
+		t.Fatalf("ensureUser b: %v", err)
+	}
+	if a.ID == b.ID || a.Subject == b.Subject {
+		t.Fatalf("expected two distinct users, got %+v and %+v", a, b)
+	}
+}
+
 func TestCORSAllowsFrontendOrigin(t *testing.T) {
 	db := testDB(t)
 	srv := New(db, NewVerifier(OIDC{}), nil, config.Config{FrontendOrigin: "https://domain.tld"})
